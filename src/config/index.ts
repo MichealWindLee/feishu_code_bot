@@ -1,6 +1,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { config as loadDotenv } from "dotenv";
 import type { AppConfig, ApprovalPolicy, LoadConfigOptions, SandboxMode } from "./types.js";
+
+let defaultDotenvLoaded = false;
 
 const defaultConfig: AppConfig = {
   feishu: {
@@ -40,6 +43,17 @@ export function parseCliConfigOptions(argv: string[]): LoadConfigOptions {
       options.debugPromptAcceptedFeedback = false;
       continue;
     }
+    if (arg === "--env-file" || arg === "-e") {
+      const envPath = argv[index + 1];
+      if (!envPath) throw new Error(`${arg} requires a dotenv file path`);
+      options.envPath = envPath;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--env-file=")) {
+      options.envPath = arg.slice("--env-file=".length);
+      continue;
+    }
     if (arg === "--config" || arg === "-c") {
       const configPath = argv[index + 1];
       if (!configPath) throw new Error(`${arg} requires a config path`);
@@ -57,6 +71,7 @@ export function parseCliConfigOptions(argv: string[]): LoadConfigOptions {
 
 export function loadConfig(options: LoadConfigOptions | string = {}): AppConfig {
   const loadOptions: LoadConfigOptions = typeof options === "string" ? { configPath: options } : options;
+  loadEnvFile(loadOptions.envPath);
   const configPath = loadOptions.configPath ?? process.env.FEISHU_CODE_BOT_CONFIG;
   const fromFile = configPath ? readJson(configPath) : {};
   const merged = deepMerge(defaultConfig, fromFile) as AppConfig;
@@ -73,6 +88,17 @@ export function loadConfig(options: LoadConfigOptions | string = {}): AppConfig 
   normalizeConfig(merged);
   validateConfig(merged);
   return merged;
+}
+
+function loadEnvFile(envPath: string | undefined): void {
+  if (envPath) {
+    loadDotenv({ path: resolve(envPath), quiet: true });
+    return;
+  }
+  if (!defaultDotenvLoaded) {
+    loadDotenv({ quiet: true });
+    defaultDotenvLoaded = true;
+  }
 }
 
 function readJson(configPath: string): unknown {

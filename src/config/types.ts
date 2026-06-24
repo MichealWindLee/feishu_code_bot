@@ -38,5 +38,6 @@ export interface AppConfig {
 
 export interface LoadConfigOptions {
   configPath?: string;
+  envPath?: string;
   debugPromptAcceptedFeedback?: boolean;
 }

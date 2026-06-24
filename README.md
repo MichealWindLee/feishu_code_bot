@@ -51,18 +51,22 @@ src/
 ```bash
 pnpm install
 cp config.example.json config.local.json
+cp .env.example .env
 ```
 
 Edit `config.local.json` with your Feishu app credentials, bot open id, allowed users, and static projects.
+Edit `.env` if you want environment-based overrides. The service loads `.env` automatically before reading `process.env`.
 
 ```bash
 FEISHU_CODE_BOT_CONFIG=./config.local.json pnpm dev
+pnpm dev
 ```
 
 You can also pass the config path and debug mode as startup arguments:
 
 ```bash
 pnpm dev -- --config ./config.local.json
+pnpm dev -- --env-file ./.env.local
 pnpm dev -- --config ./config.local.json --debug
 pnpm dev:debug -- --config ./config.local.json
 ```
