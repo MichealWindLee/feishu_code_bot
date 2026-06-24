@@ -6,6 +6,8 @@ import type {
   CodexApprovalRequest,
   CodexDriver,
   CodexEvent,
+  CodexItemSummary,
+  CodexPlanStep,
   CodexThread,
   InterruptTurnInput,
   ResolveApprovalInput,
@@ -34,6 +36,7 @@ export class CodexAppServerDriver implements CodexDriver {
   private nextId = 1;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly turnQueues = new Map<string, AsyncQueue<CodexEvent>>();
+  private readonly turnThreadIds = new Map<string, string>();
   private readonly bufferedTurnEvents = new Map<string, CodexEvent[]>();
   private initialized = false;
 
@@ -51,6 +54,7 @@ export class CodexAppServerDriver implements CodexDriver {
       this.pending.clear();
       for (const queue of this.turnQueues.values()) queue.throw(error);
       this.turnQueues.clear();
+      this.turnThreadIds.clear();
       this.bufferedTurnEvents.clear();
       this.proc = null;
       this.initialized = false;
@@ -117,6 +121,7 @@ export class CodexAppServerDriver implements CodexDriver {
 
     const queue = new AsyncQueue<CodexEvent>();
     this.turnQueues.set(turnId, queue);
+    this.turnThreadIds.set(turnId, input.threadId);
     queue.push({ type: "turn_started", threadId: input.threadId, turnId });
     this.flushBufferedTurnEvents(turnId, queue);
 
@@ -126,6 +131,7 @@ export class CodexAppServerDriver implements CodexDriver {
       }
     } finally {
       this.turnQueues.delete(turnId);
+      this.turnThreadIds.delete(turnId);
     }
   }
 
@@ -219,6 +225,57 @@ export class CodexAppServerDriver implements CodexDriver {
         }
         break;
       }
+      case "turn/plan/updated": {
+        if (turnId) {
+          this.pushTurnEvent(turnId, {
+            type: "plan_updated",
+            threadId: String(params?.threadId ?? ""),
+            turnId,
+            explanation: typeof params?.explanation === "string" ? params.explanation : null,
+            steps: readPlanSteps(params),
+          });
+        }
+        break;
+      }
+      case "item/started": {
+        if (turnId) {
+          this.pushTurnEvent(turnId, {
+            type: "item_started",
+            threadId: String(params?.threadId ?? ""),
+            turnId,
+            item: summarizeItem((params as { item?: unknown } | undefined)?.item),
+          });
+        }
+        break;
+      }
+      case "item/completed": {
+        if (turnId) {
+          this.pushTurnEvent(turnId, {
+            type: "item_completed",
+            threadId: String(params?.threadId ?? ""),
+            turnId,
+            item: summarizeItem((params as { item?: unknown } | undefined)?.item),
+          });
+        }
+        break;
+      }
+      case "turn/diff/updated": {
+        if (turnId) {
+          const diff = typeof params?.diff === "string" ? params.diff : "";
+          this.pushTurnEvent(turnId, {
+            type: "diff_updated",
+            threadId: String(params?.threadId ?? ""),
+            turnId,
+            diff,
+            changedFiles: extractChangedFilesFromDiff(diff),
+          });
+        }
+        break;
+      }
+      case "warning": {
+        this.pushWarningEvent(params);
+        break;
+      }
       case "turn/completed": {
         if (turnId) {
           const status = readTurnStatus(params);
@@ -232,7 +289,7 @@ export class CodexAppServerDriver implements CodexDriver {
         break;
       }
       case "error": {
-        const error = new Error(String((params as { message?: string } | undefined)?.message ?? "Codex error"));
+        const error = new Error(readErrorMessage(params));
         const queue = turnId ? this.turnQueues.get(turnId) : undefined;
         if (queue) queue.throw(error);
         else if (turnId) this.pushTurnEvent(turnId, { type: "error", turnId, message: error.message });
@@ -241,6 +298,18 @@ export class CodexAppServerDriver implements CodexDriver {
       }
       default:
         break;
+    }
+  }
+
+  private pushWarningEvent(params: Record<string, unknown> | undefined): void {
+    const threadId = typeof params?.threadId === "string" ? params.threadId : undefined;
+    const message = typeof params?.message === "string" ? params.message : "Codex warning";
+    if (!threadId) {
+      for (const queue of this.turnQueues.values()) queue.push({ type: "warning", message });
+      return;
+    }
+    for (const [turnId, queue] of this.turnQueues.entries()) {
+      if (this.turnThreadIds.get(turnId) === threadId) queue.push({ type: "warning", threadId, message });
     }
   }
 
@@ -292,6 +361,7 @@ export class CodexAppServerDriver implements CodexDriver {
     this.pending.clear();
     for (const queue of this.turnQueues.values()) queue.throw(error);
     this.turnQueues.clear();
+    this.turnThreadIds.clear();
     this.bufferedTurnEvents.clear();
   }
 }
@@ -304,6 +374,125 @@ function threadParams(project: ProjectConfig, config: AppConfig): Record<string,
     model: project.model ?? config.codex.model,
     serviceName: "feishu-code-bot",
   };
+}
+
+function readPlanSteps(params: Record<string, unknown> | undefined): CodexPlanStep[] {
+  const plan = Array.isArray(params?.plan) ? params.plan : [];
+  return plan.map((step): CodexPlanStep => {
+    const record = asRecord(step);
+    return {
+      step: stringOr(record?.step, "(unknown step)"),
+      status: readPlanStepStatus(record?.status),
+    };
+  });
+}
+
+function readPlanStepStatus(status: unknown): CodexPlanStep["status"] {
+  return status === "pending" || status === "inProgress" || status === "completed" ? status : "pending";
+}
+
+function summarizeItem(item: unknown): CodexItemSummary {
+  const record = asRecord(item);
+  if (!record) return { id: "unknown", type: "other", title: "Codex activity" };
+
+  const id = stringOr(record.id, "unknown");
+  switch (record.type) {
+    case "userMessage":
+      return { id, type: "user_message", title: "User message" };
+    case "agentMessage":
+      return {
+        id,
+        type: "agent_message",
+        title: "Agent response",
+        text: typeof record.text === "string" ? record.text : undefined,
+        status: typeof record.phase === "string" ? record.phase : undefined,
+      };
+    case "reasoning":
+      return { id, type: "reasoning", title: "Reasoning" };
+    case "commandExecution":
+      return {
+        id,
+        type: "command_execution",
+        title: stringOr(record.command, "Command execution"),
+        status: typeof record.status === "string" ? record.status : undefined,
+        command: typeof record.command === "string" ? record.command : undefined,
+        cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+        exitCode: typeof record.exitCode === "number" || record.exitCode === null ? record.exitCode : undefined,
+        durationMs: typeof record.durationMs === "number" || record.durationMs === null ? record.durationMs : undefined,
+      };
+    case "fileChange":
+      return {
+        id,
+        type: "file_change",
+        title: "File changes",
+        status: typeof record.status === "string" ? record.status : undefined,
+        changedFiles: readChangedFiles(record.changes),
+      };
+    case "mcpToolCall":
+      return {
+        id,
+        type: "mcp_tool_call",
+        title: `MCP tool: ${stringOr(record.tool, "unknown")}`,
+        status: typeof record.status === "string" ? record.status : undefined,
+        toolName: [record.server, record.tool].filter((value) => typeof value === "string").join(".") || undefined,
+        durationMs: typeof record.durationMs === "number" || record.durationMs === null ? record.durationMs : undefined,
+      };
+    case "dynamicToolCall":
+      return {
+        id,
+        type: "dynamic_tool_call",
+        title: `Tool: ${stringOr(record.tool, "unknown")}`,
+        status: typeof record.status === "string" ? record.status : undefined,
+        toolName: [record.namespace, record.tool].filter((value) => typeof value === "string").join(".") || undefined,
+        durationMs: typeof record.durationMs === "number" || record.durationMs === null ? record.durationMs : undefined,
+      };
+    case "webSearch":
+      return {
+        id,
+        type: "web_search",
+        title: `Web search: ${stringOr(record.query, "unknown")}`,
+      };
+    case "imageGeneration":
+      return {
+        id,
+        type: "image_generation",
+        title: "Image generation",
+        status: typeof record.status === "string" ? record.status : undefined,
+      };
+    default:
+      return { id, type: "other", title: typeof record.type === "string" ? record.type : "Codex activity" };
+  }
+}
+
+function readChangedFiles(changes: unknown): string[] {
+  if (!Array.isArray(changes)) return [];
+  return [...new Set(changes.map((change) => asRecord(change)?.path).filter((path): path is string => typeof path === "string"))];
+}
+
+function extractChangedFilesFromDiff(diff: string): string[] {
+  const files = new Set<string>();
+  for (const line of diff.split("\n")) {
+    const diffMatch = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (diffMatch?.[2]) files.add(diffMatch[2]);
+    const newFileMatch = line.match(/^\+\+\+ b\/(.+)$/);
+    if (newFileMatch?.[1]) files.add(newFileMatch[1]);
+  }
+  return [...files];
+}
+
+function readErrorMessage(params: Record<string, unknown> | undefined): string {
+  if (typeof params?.message === "string") return params.message;
+  const error = asRecord(params?.error);
+  if (typeof error?.message === "string") return error.message;
+  return "Codex error";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
 }
 
 function toApprovalRequest(message: RpcMessage): CodexApprovalRequest | null {

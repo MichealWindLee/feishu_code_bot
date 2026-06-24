@@ -16,7 +16,6 @@ import type {
   FeishuInboundEvent,
   FeishuMessagePort,
   ReplyTarget,
-  SendOptions,
   SendResult,
 } from "../src/feishu/types.js";
 import { mkdtempSync } from "node:fs";
@@ -32,8 +31,9 @@ describe("BotService", () => {
 
     expect(codex.startedThreads).toHaveLength(1);
     expect(codex.turnInputs.map((input) => input.text)).toEqual(["hello codex"]);
-    expect(messages.markdown).toEqual([]);
-    expect(messages.streams.join("")).toBe("done");
+    expect(messages.cards).toHaveLength(1);
+    expect(messages.cardUpdates.length).toBeGreaterThan(0);
+    expect(messages.markdown.at(-1)).toBe("done");
   });
 
   it("sends prompt accepted feedback only when debug is enabled", async () => {
@@ -43,6 +43,61 @@ describe("BotService", () => {
     await service.waitForIdle();
 
     expect(messages.markdown[0]).toContain("已收到");
+  });
+
+  it("renders turn status cards from plan and item events", async () => {
+    const { service, messages } = makeHarness([
+      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      {
+        type: "plan_updated",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        explanation: null,
+        steps: [{ step: "Run tests", status: "inProgress" }],
+      },
+      {
+        type: "item_started",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-1",
+          type: "command_execution",
+          title: "pnpm test",
+          command: "pnpm test",
+          status: "inProgress",
+        },
+      },
+      {
+        type: "item_completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-1",
+          type: "command_execution",
+          title: "pnpm test",
+          command: "pnpm test",
+          status: "completed",
+          exitCode: 0,
+        },
+      },
+      { type: "diff_updated", threadId: "thread-1", turnId: "turn-1", diff: "", changedFiles: ["src/foo.ts"] },
+      {
+        type: "item_completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: { id: "item-2", type: "agent_message", title: "Agent response", text: "final answer" },
+      },
+      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+    ]);
+
+    await service.handleEvent(message("run tests"));
+    await service.waitForIdle();
+
+    const cardText = JSON.stringify([...messages.cards, ...messages.cardUpdates.map((update) => update.card)]);
+    expect(cardText).toContain("Run tests");
+    expect(cardText).toContain("pnpm test");
+    expect(cardText).toContain("src/foo.ts");
+    expect(messages.markdown.at(-1)).toBe("final answer");
   });
 
   it("blocks ordinary messages when a turn is active", async () => {
@@ -165,7 +220,6 @@ function testConfig(botOverrides: Partial<AppConfig["bot"]> = {}): AppConfig {
     bot: {
       approvalTtlMs: 60_000,
       eventDedupTtlMs: 60_000,
-      streamFlushMs: 1,
       debugPromptAcceptedFeedback: false,
       ...botOverrides,
     },
@@ -200,29 +254,22 @@ class FakeGateway implements FeishuGateway {
 
 class FakeMessages implements FeishuMessagePort {
   markdown: string[] = [];
-  streams: string[] = [];
+  cards: object[] = [];
+  cardUpdates: Array<{ messageId: string; card: object }> = [];
 
   async sendMarkdown(_target: ReplyTarget, markdown: string): Promise<SendResult> {
     this.markdown.push(markdown);
     return { messageId: `sent-${this.markdown.length}` };
   }
 
-  async streamMarkdown(
-    _target: ReplyTarget,
-    stream: AsyncIterable<string>,
-    _opts?: SendOptions,
-  ): Promise<SendResult> {
-    let text = "";
-    for await (const chunk of stream) text += chunk;
-    this.streams.push(text);
-    return { messageId: `stream-${this.streams.length}` };
+  async sendCard(_target: ReplyTarget, card: object): Promise<SendResult> {
+    this.cards.push(card);
+    return { messageId: `card-${this.cards.length}` };
   }
 
-  async sendCard(): Promise<SendResult> {
-    return { messageId: "card-1" };
+  async updateCard(messageId: string, card: object): Promise<void> {
+    this.cardUpdates.push({ messageId, card });
   }
-
-  async updateCard(): Promise<void> {}
 }
 
 class FakeCodex implements CodexDriver {

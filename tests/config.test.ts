@@ -22,7 +22,6 @@ describe("config", () => {
       bot: {
         approvalTtlMs: 1_800_000,
         eventDedupTtlMs: 86_400_000,
-        streamFlushMs: 1200,
         debugPromptAcceptedFeedback: false,
       },
     });

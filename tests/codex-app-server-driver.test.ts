@@ -40,6 +40,30 @@ describe("CodexAppServerDriver", () => {
       turnId: "turn-1",
     });
     expect((await iterator.next()).value).toEqual({
+      type: "plan_updated",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      explanation: null,
+      steps: [{ step: "Run tests", status: "inProgress" }],
+    });
+    expect((await iterator.next()).value).toEqual({
+      type: "item_started",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: expect.objectContaining({
+        id: "item-cmd",
+        type: "command_execution",
+        command: "pnpm test",
+      }),
+    });
+    expect((await iterator.next()).value).toEqual({
+      type: "diff_updated",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      diff: "diff --git a/src/foo.ts b/src/foo.ts\n",
+      changedFiles: ["src/foo.ts"],
+    });
+    expect((await iterator.next()).value).toEqual({
       type: "agent_delta",
       threadId: "thread-1",
       turnId: "turn-1",
@@ -87,7 +111,6 @@ function testConfig(binaryPath: string): AppConfig {
     bot: {
       approvalTtlMs: 60_000,
       eventDedupTtlMs: 60_000,
-      streamFlushMs: 1,
       debugPromptAcceptedFeedback: false,
     },
   };
@@ -131,6 +154,32 @@ rl.on("line", (line) => {
   }
   if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1", status: "running" } } });
+    send({ method: "turn/plan/updated", params: {
+      threadId: message.params.threadId,
+      turnId: "turn-1",
+      explanation: null,
+      plan: [{ step: "Run tests", status: "inProgress" }]
+    }});
+    send({ method: "item/started", params: {
+      threadId: message.params.threadId,
+      turnId: "turn-1",
+      item: {
+        type: "commandExecution",
+        id: "item-cmd",
+        command: "pnpm test",
+        cwd: message.params.cwd,
+        status: "inProgress",
+        commandActions: [],
+        aggregatedOutput: null,
+        exitCode: null,
+        durationMs: null
+      }
+    }});
+    send({ method: "turn/diff/updated", params: {
+      threadId: message.params.threadId,
+      turnId: "turn-1",
+      diff: "diff --git a/src/foo.ts b/src/foo.ts\\n"
+    }});
     send({ method: "item/agentMessage/delta", params: {
       threadId: message.params.threadId,
       turnId: "turn-1",

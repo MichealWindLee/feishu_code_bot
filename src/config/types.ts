@@ -31,7 +31,6 @@ export interface AppConfig {
   bot: {
     approvalTtlMs: number;
     eventDedupTtlMs: number;
-    streamFlushMs: number;
     debugPromptAcceptedFeedback: boolean;
   };
 }

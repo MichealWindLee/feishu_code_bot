@@ -25,7 +25,6 @@ const defaultConfig: AppConfig = {
   bot: {
     approvalTtlMs: 30 * 60 * 1000,
     eventDedupTtlMs: 24 * 60 * 60 * 1000,
-    streamFlushMs: 1200,
     debugPromptAcceptedFeedback: false,
   },
 };

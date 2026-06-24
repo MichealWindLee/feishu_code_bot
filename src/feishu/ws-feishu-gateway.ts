@@ -94,34 +94,6 @@ export class WsFeishuGateway implements FeishuGateway, FeishuMessagePort, Feishu
     return { messageId: extractMessageId(response) };
   }
 
-  async streamMarkdown(
-    target: ReplyTarget,
-    stream: AsyncIterable<string>,
-    opts: SendOptions = {},
-  ): Promise<SendResult> {
-    let fullText = "";
-    let result: SendResult | null = null;
-    let lastFlush = 0;
-
-    for await (const chunk of stream) {
-      fullText += chunk;
-      const now = Date.now();
-      if (!result) {
-        result = await this.sendMarkdown(target, fullText || "Codex is working...", opts);
-        lastFlush = now;
-      } else if (now - lastFlush >= this.config.bot.streamFlushMs) {
-        await this.updateTextMessage(result.messageId, fullText);
-        lastFlush = now;
-      }
-    }
-
-    if (!result) {
-      return this.sendMarkdown(target, "Codex completed without textual output.", opts);
-    }
-    await this.updateTextMessage(result.messageId, fullText || "Codex completed without textual output.");
-    return result;
-  }
-
   async sendCard(target: ReplyTarget, card: object, opts: SendOptions = {}): Promise<SendResult> {
     const replyTo = opts.replyTo ?? target.messageId;
     const payload = {
@@ -290,16 +262,6 @@ export class WsFeishuGateway implements FeishuGateway, FeishuMessagePort, Feishu
       throw new Error("Unable to resolve bot identity. Set feishu.botOpenId or FEISHU_BOT_OPEN_ID.");
     }
     return { openId: response.bot.open_id, name: response.bot.app_name ?? "bot" };
-  }
-
-  private async updateTextMessage(messageId: string, text: string): Promise<void> {
-    await this.client.im.v1.message.update({
-      path: { message_id: messageId },
-      data: {
-        msg_type: "text",
-        content: JSON.stringify({ text }),
-      },
-    } as never);
   }
 
   private async emit(event: FeishuInboundEvent): Promise<void> {

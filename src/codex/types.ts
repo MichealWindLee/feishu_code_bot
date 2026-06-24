@@ -38,11 +38,49 @@ export interface CodexApprovalRequest {
   raw: unknown;
 }
 
+export type CodexPlanStepStatus = "pending" | "inProgress" | "completed";
+
+export interface CodexPlanStep {
+  step: string;
+  status: CodexPlanStepStatus;
+}
+
+export type CodexItemType =
+  | "agent_message"
+  | "reasoning"
+  | "command_execution"
+  | "file_change"
+  | "mcp_tool_call"
+  | "dynamic_tool_call"
+  | "web_search"
+  | "image_generation"
+  | "user_message"
+  | "other";
+
+export interface CodexItemSummary {
+  id: string;
+  type: CodexItemType;
+  title: string;
+  status?: string;
+  text?: string;
+  command?: string;
+  cwd?: string;
+  exitCode?: number | null;
+  durationMs?: number | null;
+  changedFiles?: string[];
+  toolName?: string;
+}
+
 export type CodexEvent =
   | { type: "turn_started"; threadId: string; turnId: string }
   | { type: "agent_delta"; threadId: string; turnId: string; delta: string }
+  | { type: "plan_updated"; threadId: string; turnId: string; explanation?: string | null; steps: CodexPlanStep[] }
+  | { type: "item_started"; threadId: string; turnId: string; item: CodexItemSummary }
+  | { type: "item_completed"; threadId: string; turnId: string; item: CodexItemSummary }
+  | { type: "diff_updated"; threadId: string; turnId: string; diff: string; changedFiles: string[] }
   | { type: "approval_requested"; approval: CodexApprovalRequest }
   | { type: "turn_completed"; threadId: string; turnId: string; status: string }
+  | { type: "warning"; threadId?: string; message: string }
   | { type: "error"; threadId?: string; turnId?: string; message: string };
 
 export interface ResolveApprovalInput {

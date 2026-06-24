@@ -114,11 +114,6 @@ export interface FeishuGateway {
 
 export interface FeishuMessagePort {
   sendMarkdown(target: ReplyTarget, markdown: string, opts?: SendOptions): Promise<SendResult>;
-  streamMarkdown(
-    target: ReplyTarget,
-    stream: AsyncIterable<string>,
-    opts?: SendOptions,
-  ): Promise<SendResult>;
   sendCard(target: ReplyTarget, card: object, opts?: SendOptions): Promise<SendResult>;
   updateCard(messageId: string, card: object): Promise<void>;
 }
