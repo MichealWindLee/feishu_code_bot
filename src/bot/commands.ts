@@ -3,6 +3,7 @@ export type BotCommand =
   | { type: "projects" }
   | { type: "use"; projectKey: string }
   | { type: "new" }
+  | { type: "end" }
   | { type: "status" }
   | { type: "stop" }
   | { type: "permissions" }
@@ -26,6 +27,10 @@ export function parseCommand(input: string): BotCommand | null {
       return arg ? { type: "use", projectKey: arg } : null;
     case "new":
       return { type: "new" };
+    case "end":
+    case "close":
+    case "exit":
+      return { type: "end" };
     case "status":
       return { type: "status" };
     case "stop":
@@ -47,6 +52,7 @@ export function commandHelp(): string {
     "- /projects: list configured projects",
     "- /use <project>: switch your current project",
     "- /new: start a fresh Codex session",
+    "- /end: end your current Codex session",
     "- /status: show current session status",
     "- /stop: interrupt the active Codex turn",
     "- /permissions: show current Codex permission policy",

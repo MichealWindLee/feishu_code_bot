@@ -140,6 +140,10 @@ export class SqliteStateStore implements StateStore {
     this.db.prepare("delete from pending_approvals where approval_short_id = ?").run(approvalShortId);
   }
 
+  async deletePendingApprovalsForUser(userOpenId: string): Promise<void> {
+    this.db.prepare("delete from pending_approvals where user_open_id = ?").run(userOpenId);
+  }
+
   async rememberEvent(eventId: string, expiresAt: number): Promise<boolean> {
     try {
       this.db

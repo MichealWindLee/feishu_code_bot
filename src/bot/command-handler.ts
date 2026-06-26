@@ -42,6 +42,9 @@ export class BotCommandHandler {
       case "new":
         await this.handleNewSession(userOpenId, target);
         return;
+      case "end":
+        await this.handleEndSession(userOpenId, target);
+        return;
       case "status":
         await this.handleStatus(userOpenId, target);
         return;
@@ -109,6 +112,39 @@ export class BotCommandHandler {
       updatedAt: Date.now(),
     });
     await this.deps.messages.sendMarkdown(target, `Started a new Codex session for ${project.key}.`);
+  }
+
+  private async handleEndSession(userOpenId: string, target: ReplyTarget): Promise<void> {
+    const session = await this.deps.store.getCurrentSession(userOpenId);
+    const activeTask = this.deps.getTurnTask(userOpenId);
+    const activeTurn = getSessionActiveTurn(session) ?? this.deps.getRuntimeActiveTurn(userOpenId);
+
+    if (!session && !activeTask && !activeTurn) {
+      await this.deps.messages.sendMarkdown(target, "No Codex session to end.");
+      return;
+    }
+
+    if (activeTask) this.deps.requestStop(userOpenId);
+    if (activeTurn) {
+      await this.deps.codex.interruptTurn(activeTurn).catch(() => {
+        // Ending a session should still clear local state if Codex already exited.
+      });
+      this.deps.clearRuntimeActiveTurn(userOpenId);
+      await this.deps.store.clearActiveTurn(userOpenId, activeTurn.turnId);
+    }
+    if (activeTask) await activeTask.catch(() => undefined);
+
+    if (session) {
+      await this.deps.store.upsertCurrentSession({
+        ...session,
+        codexThreadId: null,
+        activeTurnId: null,
+        lastChatId: target.chatId,
+        updatedAt: Date.now(),
+      });
+    }
+    await this.deps.store.deletePendingApprovalsForUser(userOpenId);
+    await this.deps.messages.sendMarkdown(target, "Ended the current Codex session. Send a prompt to start a new one.");
   }
 
   private async handleStatus(userOpenId: string, target: ReplyTarget): Promise<void> {

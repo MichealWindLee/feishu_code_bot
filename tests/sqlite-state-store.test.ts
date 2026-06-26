@@ -57,4 +57,34 @@ describe("SqliteStateStore", () => {
     expect(await store.getPendingApproval("a1")).toBeNull();
     await store.close();
   });
+
+  it("deletes pending approvals by user", async () => {
+    const store = new SqliteStateStore(":memory:");
+    await store.savePendingApproval({
+      approvalShortId: "a1",
+      userOpenId: "u1",
+      codexThreadId: "thread-1",
+      turnId: "turn-1",
+      requestId: "9",
+      approvalKind: "command",
+      payloadJson: "{}",
+      expiresAt: Date.now() + 1000,
+    });
+    await store.savePendingApproval({
+      approvalShortId: "a2",
+      userOpenId: "u2",
+      codexThreadId: "thread-2",
+      turnId: "turn-2",
+      requestId: "10",
+      approvalKind: "command",
+      payloadJson: "{}",
+      expiresAt: Date.now() + 1000,
+    });
+
+    await store.deletePendingApprovalsForUser("u1");
+
+    expect(await store.getPendingApproval("a1")).toBeNull();
+    expect(await store.getPendingApproval("a2")).toBeTruthy();
+    await store.close();
+  });
 });

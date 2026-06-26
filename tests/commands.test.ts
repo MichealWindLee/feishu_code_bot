@@ -6,6 +6,9 @@ describe("parseCommand", () => {
     expect(parseCommand("/help")).toEqual({ type: "help" });
     expect(parseCommand("/projects")).toEqual({ type: "projects" });
     expect(parseCommand("/use bot")).toEqual({ type: "use", projectKey: "bot" });
+    expect(parseCommand("/end")).toEqual({ type: "end" });
+    expect(parseCommand("/close")).toEqual({ type: "end" });
+    expect(parseCommand("/exit")).toEqual({ type: "end" });
     expect(parseCommand("/approve abc123")).toEqual({ type: "approve", approvalId: "abc123" });
     expect(parseCommand("/deny abc123")).toEqual({ type: "deny", approvalId: "abc123" });
   });

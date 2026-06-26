@@ -187,6 +187,41 @@ describe("BotService", () => {
     release.resolve();
     await service.waitForIdle();
   });
+
+  it("ends the current Codex session and clears pending approvals", async () => {
+    const { service, codex, messages, store } = makeHarness();
+    await store.upsertCurrentSession({
+      userOpenId: "u1",
+      projectKey: "bot",
+      codexThreadId: "thread-1",
+      activeTurnId: "turn-1",
+      lastChatId: "chat-1",
+      updatedAt: Date.now(),
+    });
+    await store.savePendingApproval({
+      approvalShortId: "a1",
+      userOpenId: "u1",
+      codexThreadId: "thread-1",
+      turnId: "turn-1",
+      requestId: "9",
+      approvalKind: "command",
+      payloadJson: "{}",
+      expiresAt: Date.now() + 60_000,
+    });
+
+    await service.handleEvent(message("/end"));
+    await service.waitForIdle();
+
+    expect(codex.interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(await store.getPendingApproval("a1")).toBeNull();
+    expect(await store.getCurrentSession("u1")).toEqual(
+      expect.objectContaining({
+        codexThreadId: null,
+        activeTurnId: null,
+      }),
+    );
+    expect(messages.markdown.at(-1)).toContain("Ended");
+  });
 });
 
 type FakeCodexEvents = CodexEvent[] | ((input: StartTurnInput) => AsyncIterable<CodexEvent>);

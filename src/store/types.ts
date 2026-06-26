@@ -28,6 +28,7 @@ export interface StateStore {
   savePendingApproval(approval: PendingApproval): Promise<void>;
   getPendingApproval(approvalShortId: string): Promise<PendingApproval | null>;
   deletePendingApproval(approvalShortId: string): Promise<void>;
+  deletePendingApprovalsForUser(userOpenId: string): Promise<void>;
   rememberEvent(eventId: string, expiresAt: number): Promise<boolean>;
   cleanupExpired(now: number): Promise<void>;
   close(): Promise<void>;
