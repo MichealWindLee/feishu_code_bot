@@ -2,19 +2,9 @@ import { getProject } from "../config/index.js";
 import type { AppConfig, ProjectConfig } from "../config/types.js";
 import type { CodexDriver, CodexThread } from "../codex/types.js";
 import type { CurrentSession, StateStore } from "../store/types.js";
+import { InMemorySessionRuntime, type ActiveTurn, type SessionRuntime, type SessionStatus } from "./session-runtime.js";
 
-export type SessionStatus =
-  | "idle"
-  | "starting_turn"
-  | "running_turn"
-  | "stopping_turn"
-  | "ending_session"
-  | "resetting_session";
-
-export type ActiveTurn = {
-  threadId: string;
-  turnId: string;
-};
+export type { ActiveTurn, SessionStatus } from "./session-runtime.js";
 
 export type SessionSnapshot = {
   userOpenId: string;
@@ -58,27 +48,12 @@ export type SwitchProjectResult =
   | { status: "unknown_project"; projectKey: string }
   | { status: "busy"; currentStatus: SessionStatus };
 
-type RuntimeSessionState = {
-  status: Exclude<SessionStatus, "idle">;
-  claimId?: string;
-  activeTurn?: ActiveTurn;
-  stopRequested: boolean;
-  turnTask?: Promise<void>;
-};
-
 export class SessionManager {
-  // app-server 是服务级共享进程；thread 只需要在当前进程内 resume 一次，避免重复 resume 同一个历史 thread。
-  private readonly loadedThreads = new Set<string>();
-  // runtime 只保存单实例内的临时生命周期状态；可恢复的长期状态仍然以 StateStore 为准。
-  private readonly runtime = new Map<string, RuntimeSessionState>();
-  // 同一个 Feishu 用户的 /end、/new、/stop、prompt 必须串行，否则会互相覆盖 current_sessions。
-  private readonly userLocks = new Map<string, Promise<void>>();
-  private nextClaimId = 1;
-
   constructor(
     private readonly config: AppConfig,
     private readonly store: StateStore,
     private readonly codex: CodexDriver,
+    private readonly runtime: SessionRuntime = new InMemorySessionRuntime(),
   ) {}
 
   async getSnapshot(userOpenId: string): Promise<SessionSnapshot> {
@@ -102,7 +77,7 @@ export class SessionManager {
       if (!project) return { ok: false, reason: "missing_project", projectKey: session.projectKey };
 
       const claim: PromptClaim = {
-        claimId: String(this.nextClaimId++),
+        claimId: this.runtime.nextClaimId(),
         userOpenId,
         chatId,
         session,
@@ -110,7 +85,7 @@ export class SessionManager {
       };
       // 先同步占住 starting_turn，再让 BotService 异步启动 Codex turn。
       // 这样 /end 或第二条 prompt 不会在 startTurn 尚未返回 turnId 时误判为空闲。
-      this.runtime.set(userOpenId, {
+      this.runtime.setSessionState(userOpenId, {
         status: "starting_turn",
         claimId: claim.claimId,
         stopRequested: false,
@@ -123,7 +98,7 @@ export class SessionManager {
     const task = Promise.resolve()
       .then(run)
       .finally(() => this.finishPrompt(claim));
-    const runtime = this.runtime.get(claim.userOpenId);
+    const runtime = this.runtime.getSessionState(claim.userOpenId);
     // turnTask 让 /end、/new、waitForIdle 可以等待当前 prompt 的异步主流程收尾。
     if (runtime?.claimId === claim.claimId) runtime.turnTask = task;
     return task;
@@ -149,13 +124,13 @@ export class SessionManager {
       : await this.codex.startThread({ project: claim.project });
 
     return this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       // 用户可能在 start/resume 期间发了 /stop、/end 或 /new；旧 claim 不允许继续写 session。
       if (runtime?.claimId !== claim.claimId || runtime.stopRequested) {
         return { ok: false, reason: "stopped" };
       }
 
-      this.loadedThreads.add(thread.id);
+      this.runtime.markThreadLoaded(thread.id);
       if (!claim.session.codexThreadId) {
         const session = await this.ensureSessionUnlocked(claim.userOpenId, claim.chatId);
         await this.store.upsertCurrentSession({
@@ -171,7 +146,7 @@ export class SessionManager {
 
   async markTurnStarted(claim: PromptClaim, threadId: string, turnId: string): Promise<{ shouldInterrupt: boolean }> {
     return this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       // turn_started 到达时，如果当前 claim 已经不是最新 claim，说明这是旧异步任务的回调。
       // 此时不能写入当前 session，但现在已经拿到 turnId，调用方应该立刻 interrupt 这个过期 turn。
       if (runtime?.claimId !== claim.claimId) return { shouldInterrupt: true };
@@ -194,7 +169,7 @@ export class SessionManager {
 
   async completeTurn(claim: PromptClaim, turnId: string): Promise<void> {
     await this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       // 旧 turn 的 completed/error 不允许清理新 claim 的 activeTurn。
       if (runtime?.claimId !== claim.claimId) return;
       if (runtime.activeTurn?.turnId === turnId) runtime.activeTurn = undefined;
@@ -204,7 +179,7 @@ export class SessionManager {
 
   async failTurn(claim: PromptClaim, turnId?: string): Promise<void> {
     await this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       // 与 completeTurn 一样，只有当前 claim 才能清理当前 session 的 turn 状态。
       if (runtime?.claimId !== claim.claimId) return;
       runtime.activeTurn = undefined;
@@ -214,7 +189,7 @@ export class SessionManager {
 
   async isStopRequested(claim: PromptClaim): Promise<boolean> {
     return this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       // claim 失效时，对调用方等价于“请停止”；这样旧异步流程会自然退出。
       return runtime?.claimId !== claim.claimId || runtime.stopRequested;
     });
@@ -223,7 +198,7 @@ export class SessionManager {
   async stopTurn(userOpenId: string): Promise<StopTurnResult> {
     const request = await this.withUserLock(userOpenId, async () => {
       const session = await this.store.getCurrentSession(userOpenId);
-      const runtime = this.runtime.get(userOpenId);
+      const runtime = this.runtime.getSessionState(userOpenId);
       const activeTurn = runtime?.activeTurn ?? getSessionActiveTurn(session);
       if (runtime) {
         runtime.stopRequested = true;
@@ -239,7 +214,7 @@ export class SessionManager {
 
     await this.codex.interruptTurn(request.activeTurn);
     await this.withUserLock(userOpenId, async () => {
-      const runtime = this.runtime.get(userOpenId);
+      const runtime = this.runtime.getSessionState(userOpenId);
       if (runtime?.activeTurn?.turnId === request.activeTurn?.turnId) runtime.activeTurn = undefined;
       await this.store.clearActiveTurn(userOpenId, request.activeTurn?.turnId);
     });
@@ -249,13 +224,13 @@ export class SessionManager {
   async endSession(userOpenId: string, chatId: string): Promise<EndSessionResult> {
     const request = await this.withUserLock(userOpenId, async () => {
       const session = await this.store.getCurrentSession(userOpenId);
-      const runtime = this.runtime.get(userOpenId);
+      const runtime = this.runtime.getSessionState(userOpenId);
       const activeTurn = runtime?.activeTurn ?? getSessionActiveTurn(session);
       if (!session && !runtime && !activeTurn) return { shouldEnd: false as const };
 
       // 先进入 ending_session，再释放锁去 interrupt/等待任务。
       // 后续同用户 prompt 会排在锁后面，不会复用即将被清空的旧 thread。
-      this.runtime.set(userOpenId, {
+      this.runtime.setSessionState(userOpenId, {
         status: "ending_session",
         claimId: runtime?.claimId,
         activeTurn,
@@ -283,7 +258,7 @@ export class SessionManager {
         });
       }
       await this.store.deletePendingApprovalsForUser(userOpenId);
-      this.runtime.delete(userOpenId);
+      this.runtime.deleteSessionState(userOpenId);
     });
     return { status: "ended" };
   }
@@ -291,10 +266,10 @@ export class SessionManager {
   async startNewSession(userOpenId: string, chatId: string): Promise<NewSessionResult> {
     const request = await this.withUserLock(userOpenId, async () => {
       const session = await this.ensureSessionUnlocked(userOpenId, chatId);
-      const runtime = this.runtime.get(userOpenId);
+      const runtime = this.runtime.getSessionState(userOpenId);
       const activeTurn = runtime?.activeTurn ?? getSessionActiveTurn(session);
       // /new 不是单纯结束会话，而是“中止旧任务 + 创建新 thread”，所以用 resetting_session 标识过渡期。
-      this.runtime.set(userOpenId, {
+      this.runtime.setSessionState(userOpenId, {
         status: "resetting_session",
         claimId: runtime?.claimId,
         activeTurn,
@@ -312,13 +287,13 @@ export class SessionManager {
     const project = getProject(this.config, request.session.projectKey);
     if (!project) {
       await this.withUserLock(userOpenId, async () => {
-        this.runtime.delete(userOpenId);
+        this.runtime.deleteSessionState(userOpenId);
       });
       return { status: "missing_project", projectKey: request.session.projectKey };
     }
 
     const thread = await this.codex.startThread({ project });
-    this.loadedThreads.add(thread.id);
+    this.runtime.markThreadLoaded(thread.id);
     await this.withUserLock(userOpenId, async () => {
       const session = await this.ensureSessionUnlocked(userOpenId, chatId);
       await this.store.upsertCurrentSession({
@@ -328,7 +303,7 @@ export class SessionManager {
         lastChatId: chatId,
         updatedAt: Date.now(),
       });
-      this.runtime.delete(userOpenId);
+      this.runtime.deleteSessionState(userOpenId);
     });
     return { status: "started", projectKey: project.key };
   }
@@ -356,7 +331,7 @@ export class SessionManager {
 
   private async finishPrompt(claim: PromptClaim): Promise<void> {
     await this.withUserLock(claim.userOpenId, async () => {
-      const runtime = this.runtime.get(claim.userOpenId);
+      const runtime = this.runtime.getSessionState(claim.userOpenId);
       if (runtime?.claimId !== claim.claimId) return;
 
       if (runtime.status === "ending_session" || runtime.status === "resetting_session") {
@@ -369,15 +344,15 @@ export class SessionManager {
         return;
       }
 
-      this.runtime.delete(claim.userOpenId);
+      this.runtime.deleteSessionState(claim.userOpenId);
     });
   }
 
   private async resumeThreadIfNeeded(threadId: string, project: ProjectConfig): Promise<CodexThread> {
     // loadedThreads 是当前 app-server 进程内的缓存；服务重启后会重新 resume。
-    if (this.loadedThreads.has(threadId)) return { id: threadId };
+    if (this.runtime.isThreadLoaded(threadId)) return { id: threadId };
     const thread = await this.codex.resumeThread(threadId, { threadId, project });
-    this.loadedThreads.add(thread.id);
+    this.runtime.markThreadLoaded(thread.id);
     return thread;
   }
 
@@ -403,7 +378,7 @@ export class SessionManager {
   }
 
   private snapshotFrom(userOpenId: string, session: CurrentSession | null): SessionSnapshot {
-    const runtime = this.runtime.get(userOpenId);
+    const runtime = this.runtime.getSessionState(userOpenId);
     const activeTurn = runtime?.activeTurn ?? getSessionActiveTurn(session);
     return {
       userOpenId,
@@ -414,35 +389,17 @@ export class SessionManager {
   }
 
   private activeTurnTasks(): Promise<void>[] {
-    return [...this.runtime.values()].map((state) => state.turnTask).filter(isDefined);
+    return this.runtime.activeTurnTasks();
   }
 
   // 按用户串行化生命周期读写：同一个 userOpenId 的操作会接在上一段 promise 后执行。
   // 注意这里不是全局锁，不同用户之间不会互相阻塞。
   private async withUserLock<T>(userOpenId: string, run: () => Promise<T>): Promise<T> {
-    const previous = this.userLocks.get(userOpenId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.catch(() => undefined).then(() => current);
-    this.userLocks.set(userOpenId, tail);
-    await previous.catch(() => undefined);
-    try {
-      return await run();
-    } finally {
-      // 释放当前锁；如果期间没有新的 tail 接上来，就从 Map 移除，避免长期运行时按用户累积。
-      release();
-      if (this.userLocks.get(userOpenId) === tail) this.userLocks.delete(userOpenId);
-    }
+    return this.runtime.withUserLock(userOpenId, run);
   }
 }
 
 function getSessionActiveTurn(session: CurrentSession | null): ActiveTurn | undefined {
   if (!session?.codexThreadId || !session.activeTurnId) return undefined;
   return { threadId: session.codexThreadId, turnId: session.activeTurnId };
-}
-
-function isDefined<T>(value: T | undefined): value is T {
-  return value !== undefined;
 }
