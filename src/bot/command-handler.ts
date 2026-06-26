@@ -3,26 +3,15 @@ import { getProject } from "../config/index.js";
 import type { AppConfig } from "../config/types.js";
 import type { CodexDriver } from "../codex/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
-import type { CurrentSession, StateStore } from "../store/types.js";
-
-type ActiveTurn = {
-  threadId: string;
-  turnId: string;
-};
+import type { SessionManager, SessionStatus } from "../session/session-manager.js";
+import type { StateStore } from "../store/types.js";
 
 type BotCommandHandlerDeps = {
   config: AppConfig;
   messages: FeishuMessagePort;
   codex: CodexDriver;
   store: StateStore;
-  ensureSession(userOpenId: string, chatId: string): Promise<CurrentSession>;
-  isUserBusy(userOpenId: string): boolean;
-  isSessionBusy(userOpenId: string, session: CurrentSession): boolean;
-  getTurnTask(userOpenId: string): Promise<void> | undefined;
-  getRuntimeActiveTurn(userOpenId: string): ActiveTurn | undefined;
-  requestStop(userOpenId: string): void;
-  clearRuntimeActiveTurn(userOpenId: string): void;
-  rememberLoadedThread(threadId: string): void;
+  sessions: SessionManager;
 };
 
 export class BotCommandHandler {
@@ -66,89 +55,36 @@ export class BotCommandHandler {
   }
 
   private async handleUseProject(projectKey: string, userOpenId: string, target: ReplyTarget): Promise<void> {
-    const project = getProject(this.deps.config, projectKey);
-    if (!project) {
+    const result = await this.deps.sessions.switchProject(userOpenId, target.chatId, projectKey);
+    if (result.status === "unknown_project") {
       await this.deps.messages.sendMarkdown(target, `Unknown project: ${projectKey}\n\n${this.formatProjects()}`);
       return;
     }
-    const current = await this.deps.ensureSession(userOpenId, target.chatId);
-    if (this.deps.isSessionBusy(userOpenId, current)) {
+    if (result.status === "busy") {
       await this.deps.messages.sendMarkdown(target, "A task is running. Use /stop before switching projects.");
       return;
     }
-    await this.deps.store.upsertCurrentSession({
-      userOpenId,
-      projectKey: project.key,
-      codexThreadId: null,
-      activeTurnId: null,
-      lastChatId: target.chatId,
-      updatedAt: Date.now(),
-    });
-    await this.deps.messages.sendMarkdown(target, `Switched to project ${project.key}: ${project.name}`);
+    await this.deps.messages.sendMarkdown(target, `Switched to project ${result.projectKey}: ${result.projectName}`);
   }
 
   private async handleNewSession(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const session = await this.deps.ensureSession(userOpenId, target.chatId);
-    const activeTask = this.deps.getTurnTask(userOpenId);
-    const activeTurn = getSessionActiveTurn(session) ?? this.deps.getRuntimeActiveTurn(userOpenId);
-    if (activeTask) this.deps.requestStop(userOpenId);
-    if (activeTurn) {
-      await this.deps.codex.interruptTurn(activeTurn).catch(() => {
-        // The old app-server process may already be gone; /new should still create a fresh session.
-      });
-      this.deps.clearRuntimeActiveTurn(userOpenId);
-    }
-    if (activeTask) await activeTask.catch(() => undefined);
-
-    const project = getProject(this.deps.config, session.projectKey);
-    if (!project) throw new Error(`Configured project missing: ${session.projectKey}`);
-    const thread = await this.deps.codex.startThread({ project });
-    this.deps.rememberLoadedThread(thread.id);
-    await this.deps.store.upsertCurrentSession({
-      ...session,
-      codexThreadId: thread.id,
-      activeTurnId: null,
-      lastChatId: target.chatId,
-      updatedAt: Date.now(),
-    });
-    await this.deps.messages.sendMarkdown(target, `Started a new Codex session for ${project.key}.`);
+    const result = await this.deps.sessions.startNewSession(userOpenId, target.chatId);
+    if (result.status === "missing_project") throw new Error(`Configured project missing: ${result.projectKey}`);
+    await this.deps.messages.sendMarkdown(target, `Started a new Codex session for ${result.projectKey}.`);
   }
 
   private async handleEndSession(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const session = await this.deps.store.getCurrentSession(userOpenId);
-    const activeTask = this.deps.getTurnTask(userOpenId);
-    const activeTurn = getSessionActiveTurn(session) ?? this.deps.getRuntimeActiveTurn(userOpenId);
-
-    if (!session && !activeTask && !activeTurn) {
+    const result = await this.deps.sessions.endSession(userOpenId, target.chatId);
+    if (result.status === "none") {
       await this.deps.messages.sendMarkdown(target, "No Codex session to end.");
       return;
     }
-
-    if (activeTask) this.deps.requestStop(userOpenId);
-    if (activeTurn) {
-      await this.deps.codex.interruptTurn(activeTurn).catch(() => {
-        // Ending a session should still clear local state if Codex already exited.
-      });
-      this.deps.clearRuntimeActiveTurn(userOpenId);
-      await this.deps.store.clearActiveTurn(userOpenId, activeTurn.turnId);
-    }
-    if (activeTask) await activeTask.catch(() => undefined);
-
-    if (session) {
-      await this.deps.store.upsertCurrentSession({
-        ...session,
-        codexThreadId: null,
-        activeTurnId: null,
-        lastChatId: target.chatId,
-        updatedAt: Date.now(),
-      });
-    }
-    await this.deps.store.deletePendingApprovalsForUser(userOpenId);
     await this.deps.messages.sendMarkdown(target, "Ended the current Codex session. Send a prompt to start a new one.");
   }
 
   private async handleStatus(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const session = await this.deps.store.getCurrentSession(userOpenId);
+    const snapshot = await this.deps.sessions.getSnapshot(userOpenId);
+    const session = snapshot.session;
     if (!session) {
       await this.deps.messages.sendMarkdown(target, "No Codex session yet. Send a prompt or use /projects.");
       return;
@@ -158,32 +94,26 @@ export class BotCommandHandler {
       [
         `Project: ${session.projectKey}`,
         `Thread: ${session.codexThreadId ?? "(not started)"}`,
-        `Active turn: ${session.activeTurnId ?? (this.deps.isUserBusy(userOpenId) ? "(starting)" : "(none)")}`,
+        `Active turn: ${session.activeTurnId ?? (snapshot.status === "idle" ? "(none)" : `(${statusLabel(snapshot.status)})`)}`,
       ].join("\n"),
     );
   }
 
   private async handleStop(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const session = await this.deps.store.getCurrentSession(userOpenId);
-    const activeTurn = getSessionActiveTurn(session) ?? this.deps.getRuntimeActiveTurn(userOpenId);
-    if (!activeTurn) {
-      if (this.deps.isUserBusy(userOpenId)) {
-        this.deps.requestStop(userOpenId);
-        await this.deps.messages.sendMarkdown(target, "Stop requested. The Codex task is still starting.");
-        return;
-      }
+    const result = await this.deps.sessions.stopTurn(userOpenId);
+    if (result.status === "starting") {
+      await this.deps.messages.sendMarkdown(target, "Stop requested. The Codex task is still starting.");
+      return;
+    }
+    if (result.status === "none") {
       await this.deps.messages.sendMarkdown(target, "No active Codex task.");
       return;
     }
-    this.deps.requestStop(userOpenId);
-    await this.deps.codex.interruptTurn(activeTurn);
-    this.deps.clearRuntimeActiveTurn(userOpenId);
-    await this.deps.store.clearActiveTurn(userOpenId, activeTurn.turnId);
     await this.deps.messages.sendMarkdown(target, "Stopped the active Codex task.");
   }
 
   private async handlePermissions(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const session = await this.deps.ensureSession(userOpenId, target.chatId);
+    const session = await this.deps.sessions.ensureSession(userOpenId, target.chatId);
     const project = getProject(this.deps.config, session.projectKey);
     await this.deps.messages.sendMarkdown(
       target,
@@ -244,7 +174,21 @@ export function commandFromActionValue(value: unknown): BotCommand | null {
   return null;
 }
 
-function getSessionActiveTurn(session: CurrentSession | null): ActiveTurn | undefined {
-  if (!session?.codexThreadId || !session.activeTurnId) return undefined;
-  return { threadId: session.codexThreadId, turnId: session.activeTurnId };
+function statusLabel(status: SessionStatus): string {
+  switch (status) {
+    case "starting_turn":
+      return "starting";
+    case "running_turn":
+      return "running";
+    case "stopping_turn":
+      return "stopping";
+    case "ending_session":
+      return "ending";
+    case "resetting_session":
+      return "resetting";
+    case "idle":
+      return "none";
+    default:
+      return status;
+  }
 }

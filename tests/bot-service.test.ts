@@ -222,6 +222,39 @@ describe("BotService", () => {
     );
     expect(messages.markdown.at(-1)).toContain("Ended");
   });
+
+  it("queues new prompts while an idle session is ending", async () => {
+    const { service, codex, messages, store } = makeHarness();
+    await store.upsertCurrentSession({
+      userOpenId: "u1",
+      projectKey: "bot",
+      codexThreadId: "thread-1",
+      activeTurnId: null,
+      lastChatId: "chat-1",
+      updatedAt: Date.now(),
+    });
+    const releaseDelete = deferred<void>();
+    const originalDeletePendingApprovals = store.deletePendingApprovalsForUser.bind(store);
+    let deleteStarted = false;
+    store.deletePendingApprovalsForUser = async (userOpenId: string) => {
+      deleteStarted = true;
+      await releaseDelete.promise;
+      await originalDeletePendingApprovals(userOpenId);
+    };
+
+    await service.handleEvent(message("/end"));
+    await waitUntil(() => deleteStarted);
+    await service.handleEvent(message("start immediately"));
+    await delay(10);
+
+    expect(codex.turnInputs).toHaveLength(0);
+
+    releaseDelete.resolve();
+    await service.waitForIdle();
+    expect(codex.startedThreads).toHaveLength(1);
+    expect(codex.turnInputs.map((input) => input.text)).toEqual(["start immediately"]);
+    expect(await store.getCurrentSession("u1")).toEqual(expect.objectContaining({ codexThreadId: "thread-1" }));
+  });
 });
 
 type FakeCodexEvents = CodexEvent[] | ((input: StartTurnInput) => AsyncIterable<CodexEvent>);

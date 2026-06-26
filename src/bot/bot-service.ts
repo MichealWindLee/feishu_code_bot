@@ -1,7 +1,6 @@
 import { BotCommandHandler, commandFromActionValue } from "./command-handler.js";
 import { parseCommand } from "./commands.js";
 import { TurnStatusReporter } from "./turn-status-reporter.js";
-import { getProject } from "../config/index.js";
 import type { AppConfig } from "../config/types.js";
 import type { CodexDriver, CodexEvent } from "../codex/types.js";
 import type {
@@ -13,15 +12,12 @@ import type {
   FeishuMessagePort,
   ReplyTarget,
 } from "../feishu/types.js";
-import type { CurrentSession, PendingApproval, StateStore } from "../store/types.js";
+import { SessionManager, type PromptClaim } from "../session/session-manager.js";
+import type { PendingApproval, StateStore } from "../store/types.js";
 
 export class BotService {
-  private readonly loadedThreads = new Set<string>();
   private readonly eventTasks = new Set<Promise<void>>();
-  private readonly turnTasks = new Map<string, Promise<void>>();
-  private readonly activeTurns = new Map<string, { threadId: string; turnId: string }>();
-  private readonly startingUsers = new Set<string>();
-  private readonly stopRequestedUsers = new Set<string>();
+  private readonly sessions: SessionManager;
   private readonly commands: BotCommandHandler;
   private cleanupTimer: NodeJS.Timeout | null = null;
   private stopping = false;
@@ -33,19 +29,13 @@ export class BotService {
     private readonly codex: CodexDriver,
     private readonly store: StateStore,
   ) {
+    this.sessions = new SessionManager(this.config, this.store, this.codex);
     this.commands = new BotCommandHandler({
       config: this.config,
       messages: this.messages,
       codex: this.codex,
       store: this.store,
-      ensureSession: (userOpenId, chatId) => this.ensureSession(userOpenId, chatId),
-      isUserBusy: (userOpenId) => this.isUserBusy(userOpenId),
-      isSessionBusy: (userOpenId, session) => this.isSessionBusy(userOpenId, session),
-      getTurnTask: (userOpenId) => this.turnTasks.get(userOpenId),
-      getRuntimeActiveTurn: (userOpenId) => this.activeTurns.get(userOpenId),
-      requestStop: (userOpenId) => this.stopRequestedUsers.add(userOpenId),
-      clearRuntimeActiveTurn: (userOpenId) => this.activeTurns.delete(userOpenId),
-      rememberLoadedThread: (threadId) => this.loadedThreads.add(threadId),
+      sessions: this.sessions,
     });
   }
 
@@ -90,9 +80,10 @@ export class BotService {
   }
 
   async waitForIdle(): Promise<void> {
-    while (this.eventTasks.size > 0 || this.turnTasks.size > 0) {
-      await Promise.allSettled([...this.eventTasks, ...this.turnTasks.values()]);
+    while (this.eventTasks.size > 0) {
+      await Promise.allSettled([...this.eventTasks]);
     }
+    await this.sessions.waitForIdle();
   }
 
   private enqueueEvent(event: FeishuInboundEvent): void {
@@ -152,92 +143,69 @@ export class BotService {
 
   private async handleBotMenu(event: FeishuBotMenuEvent): Promise<void> {
     if (!this.isAllowedUser(event.operatorId)) return;
-    const session = await this.store.getCurrentSession(event.operatorId);
-    if (!session?.lastChatId) return;
+    const snapshot = await this.sessions.getSnapshot(event.operatorId);
+    if (!snapshot.session?.lastChatId) return;
     const command = parseCommand(event.eventKey.startsWith("/") ? event.eventKey : `/${event.eventKey}`);
     if (!command) return;
-    await this.commands.handle(command, event.operatorId, { chatId: session.lastChatId });
+    await this.commands.handle(command, event.operatorId, { chatId: snapshot.session.lastChatId });
   }
 
   private async handlePrompt(event: FeishuMessageEvent, target: ReplyTarget): Promise<void> {
-    if (this.isUserBusy(event.senderId)) {
+    const claimResult = await this.sessions.beginPrompt(event.senderId, event.chatId);
+    if (!claimResult.ok) {
+      if (claimResult.reason === "missing_project") {
+        await this.messages.sendMarkdown(target, "Current project is no longer configured. Use /projects and /use <project>.");
+        return;
+      }
       await this.messages.sendMarkdown(target, "A Codex task is already running. Please wait or use /stop.");
       return;
     }
-    this.startingUsers.add(event.senderId);
 
-    const session = await this.ensureSession(event.senderId, event.chatId);
-    if (session.activeTurnId) {
-      this.startingUsers.delete(event.senderId);
-      await this.messages.sendMarkdown(target, "A Codex task is already running. Please wait or use /stop.");
-      return;
-    }
-
-    const project = getProject(this.config, session.projectKey);
-    if (!project) {
-      this.startingUsers.delete(event.senderId);
-      await this.messages.sendMarkdown(target, "Current project is no longer configured. Use /projects and /use <project>.");
-      return;
-    }
-
-    const task = Promise.resolve()
-      .then(() => this.runPromptTurn(event, target, session, project))
+    this.sessions.runPromptTask(claimResult.claim, () =>
+      this.runPromptTurn(event, target, claimResult.claim)
       .catch(async (error) => {
         await this.messages.sendMarkdown(target, `Codex turn failed: ${errorMessage(error)}`);
-      })
-      .finally(() => {
-        this.startingUsers.delete(event.senderId);
-        this.stopRequestedUsers.delete(event.senderId);
-        this.turnTasks.delete(event.senderId);
-      });
-    this.turnTasks.set(event.senderId, task);
+      }),
+    );
   }
 
   private async runPromptTurn(
     event: FeishuMessageEvent,
     target: ReplyTarget,
-    session: CurrentSession,
-    project: NonNullable<ReturnType<typeof getProject>>,
+    claim: PromptClaim,
   ): Promise<void> {
-    await this.sendPromptAccepted(target, project.key);
+    await this.sendPromptAccepted(target, claim.project.key);
 
-    if (this.stopRequestedUsers.has(event.senderId)) {
+    if (await this.sessions.isStopRequested(claim)) {
       await this.messages.sendMarkdown(target, "Codex task was stopped before it started.");
       return;
     }
 
-    const thread = await this.ensureThread(session, project);
-    if (this.stopRequestedUsers.has(event.senderId)) {
+    const threadResult = await this.sessions.ensureThread(claim);
+    if (!threadResult.ok || await this.sessions.isStopRequested(claim)) {
       await this.messages.sendMarkdown(target, "Codex task was stopped before it started.");
       return;
     }
 
-    const reporter = new TurnStatusReporter(this.messages, target, project.key);
+    const reporter = new TurnStatusReporter(this.messages, target, claim.project.key);
     await reporter.start();
     let currentTurnId: string | undefined;
 
     try {
       for await (const codexEvent of this.codex.startTurn({
-        threadId: thread.id,
-        project,
+        threadId: threadResult.thread.id,
+        project: claim.project,
         text: event.content,
         clientUserMessageId: event.messageId,
       })) {
-        await this.handleCodexEvent(codexEvent, event.senderId, target, reporter);
+        await this.handleCodexEvent(codexEvent, claim, target, reporter);
         if (codexEvent.type === "turn_started") {
           currentTurnId = codexEvent.turnId;
-          this.startingUsers.delete(event.senderId);
-          if (this.stopRequestedUsers.has(event.senderId)) {
-            await this.codex.interruptTurn({ threadId: thread.id, turnId: codexEvent.turnId });
-          }
         }
       }
     } catch (error) {
       await reporter.fail(errorMessage(error));
-      if (currentTurnId) await this.store.clearActiveTurn(event.senderId, currentTurnId);
-      if (currentTurnId && this.activeTurns.get(event.senderId)?.turnId === currentTurnId) {
-        this.activeTurns.delete(event.senderId);
-      }
+      await this.sessions.failTurn(claim, currentTurnId);
       await this.messages.sendMarkdown(target, `Codex turn failed: ${errorMessage(error)}`);
       return;
     }
@@ -245,7 +213,7 @@ export class BotService {
     const finalText = reporter.finalText();
     if (finalText) {
       await this.messages.sendMarkdown(target, finalText, { replyTo: event.messageId });
-    } else if (!this.stopRequestedUsers.has(event.senderId)) {
+    } else if (!(await this.sessions.isStopRequested(claim))) {
       const turnStatus = reporter.turnStatus();
       if (turnStatus === "completed") {
         await this.messages.sendMarkdown(target, "Codex completed without textual output.", { replyTo: event.messageId });
@@ -255,29 +223,21 @@ export class BotService {
         });
       }
     }
-    if (currentTurnId) await this.store.clearActiveTurn(event.senderId, currentTurnId);
-    if (currentTurnId && this.activeTurns.get(event.senderId)?.turnId === currentTurnId) {
-      this.activeTurns.delete(event.senderId);
-    }
+    if (currentTurnId) await this.sessions.completeTurn(claim, currentTurnId);
   }
 
   private async handleCodexEvent(
     event: CodexEvent,
-    userOpenId: string,
+    claim: PromptClaim,
     target: ReplyTarget,
     reporter: TurnStatusReporter,
   ): Promise<void> {
     switch (event.type) {
       case "turn_started": {
         await reporter.turnStarted(event.turnId);
-        this.activeTurns.set(userOpenId, { threadId: event.threadId, turnId: event.turnId });
-        const session = await this.store.getCurrentSession(userOpenId);
-        if (session) {
-          await this.store.upsertCurrentSession({
-            ...session,
-            activeTurnId: event.turnId,
-            updatedAt: Date.now(),
-          });
+        const result = await this.sessions.markTurnStarted(claim, event.threadId, event.turnId);
+        if (result.shouldInterrupt) {
+          await this.codex.interruptTurn({ threadId: event.threadId, turnId: event.turnId }).catch(() => undefined);
         }
         break;
       }
@@ -300,7 +260,7 @@ export class BotService {
         const shortId = createShortId();
         const pending: PendingApproval = {
           approvalShortId: shortId,
-          userOpenId,
+          userOpenId: claim.userOpenId,
           codexThreadId: event.approval.threadId,
           turnId: event.approval.turnId,
           requestId: String(event.approval.requestId),
@@ -324,10 +284,7 @@ export class BotService {
       }
       case "turn_completed":
         await reporter.completed(event.status);
-        if (this.activeTurns.get(userOpenId)?.turnId === event.turnId) {
-          this.activeTurns.delete(userOpenId);
-        }
-        await this.store.clearActiveTurn(userOpenId, event.turnId);
+        await this.sessions.completeTurn(claim, event.turnId);
         break;
       case "warning":
         await reporter.warning(event.message);
@@ -353,48 +310,6 @@ export class BotService {
     }
   }
 
-  private async ensureSession(userOpenId: string, chatId: string): Promise<CurrentSession> {
-    const current = await this.store.getCurrentSession(userOpenId);
-    if (current) {
-      const updated = { ...current, lastChatId: chatId, updatedAt: Date.now() };
-      await this.store.upsertCurrentSession(updated);
-      return updated;
-    }
-    const session: CurrentSession = {
-      userOpenId,
-      projectKey: this.config.projects[0].key,
-      codexThreadId: null,
-      activeTurnId: null,
-      lastChatId: chatId,
-      updatedAt: Date.now(),
-    };
-    await this.store.upsertCurrentSession(session);
-    return session;
-  }
-
-  private async ensureThread(session: CurrentSession, project: NonNullable<ReturnType<typeof getProject>>) {
-    if (session.codexThreadId) {
-      if (!this.loadedThreads.has(session.codexThreadId)) {
-        const thread = await this.codex.resumeThread(session.codexThreadId, {
-          threadId: session.codexThreadId,
-          project,
-        });
-        this.loadedThreads.add(thread.id);
-        return thread;
-      }
-      return { id: session.codexThreadId };
-    }
-
-    const thread = await this.codex.startThread({ project });
-    this.loadedThreads.add(thread.id);
-    await this.store.upsertCurrentSession({
-      ...session,
-      codexThreadId: thread.id,
-      updatedAt: Date.now(),
-    });
-    return thread;
-  }
-
   private isAllowedUser(openId: string): boolean {
     const allowed = this.config.feishu.allowedUsers;
     return allowed.length === 0 || allowed.includes(openId);
@@ -404,14 +319,6 @@ export class BotService {
     const allowedChats = this.config.feishu.allowedChats;
     if (allowedChats.length > 0 && !allowedChats.includes(event.chatId)) return false;
     return event.mentionedBot;
-  }
-
-  private isUserBusy(userOpenId: string): boolean {
-    return this.startingUsers.has(userOpenId) || this.turnTasks.has(userOpenId) || this.activeTurns.has(userOpenId);
-  }
-
-  private isSessionBusy(userOpenId: string, session: CurrentSession): boolean {
-    return Boolean(session.activeTurnId) || this.isUserBusy(userOpenId);
   }
 }
 
