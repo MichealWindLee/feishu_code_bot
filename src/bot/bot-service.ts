@@ -164,7 +164,7 @@ export class BotService {
     this.sessions.runPromptTask(claimResult.claim, () =>
       this.runPromptTurn(event, target, claimResult.claim)
       .catch(async (error) => {
-        await this.messages.sendMarkdown(target, `Codex turn failed: ${errorMessage(error)}`);
+        await this.messages.sendMarkdown(target, `Codex turn run failed: ${errorMessage(error)}`);
       }),
     );
   }
@@ -206,7 +206,7 @@ export class BotService {
     } catch (error) {
       await reporter.fail(errorMessage(error));
       await this.sessions.failTurn(claim, currentTurnId);
-      await this.messages.sendMarkdown(target, `Codex turn failed: ${errorMessage(error)}`);
+      await this.messages.sendMarkdown(target, `Codex turn event failed: ${errorMessage(error)}`);
       return;
     }
 
