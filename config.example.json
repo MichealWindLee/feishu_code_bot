@@ -26,7 +26,6 @@
   "bot": {
     "approvalTtlMs": 1800000,
     "eventDedupTtlMs": 86400000,
-    "streamFlushMs": 1200,
     "debugPromptAcceptedFeedback": false
   }
 }

@@ -15,6 +15,7 @@ Node.js/TypeScript MVP for driving `codex app-server` from Feishu Bot conversati
   - `/projects`
   - `/use <project>`
   - `/new`
+  - `/end`
   - `/status`
   - `/stop`
   - `/permissions`
@@ -77,6 +78,7 @@ The server expects Codex to already be logged in on the machine running the bot.
 
 - One current Codex session per Feishu user.
 - `/new` starts a fresh Codex thread and replaces that user's current session.
+- `/end` clears the current Codex session binding and pending approvals without deleting Codex history.
 - Ordinary messages use `turn/start`; `turn/steer` is intentionally not used automatically.
 - If a turn is already active, the bot asks the user to wait or run `/stop`.
 - On service restart, the bot can resume the previous Codex thread history, but it does not guarantee reconnecting to an in-flight turn.
