@@ -1,17 +1,22 @@
-import type { CodexItemSummary, CodexPlanStep } from "../codex/types.js";
+import type { CodexAgentMessagePhase, CodexItemSummary, CodexPlanStep } from "../codex/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
 
 type CardStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "interrupted";
+
+const PROGRESS_UPDATE_INTERVAL_MS = 20_000;
+const MIN_PROGRESS_DELTA_LENGTH = 40;
 
 export class TurnStatusReporter {
   private messageId: string | null = null;
   private status: CardStatus = "queued";
   private current = "等待 Codex 开始处理";
-  private activeTurnId: string | null = null;
   private lastTurnStatus = "inProgress";
   private readonly plan: CodexPlanStep[] = [];
-  private readonly recentActivities: string[] = [];
   private readonly changedFiles = new Set<string>();
+  private progressText = "";
+  private progressDraft = "";
+  private progressItemId: string | null = null;
+  private lastProgressCardAt = 0;
   private agentText = "";
   private commandCount = 0;
   private toolCount = 0;
@@ -28,45 +33,64 @@ export class TurnStatusReporter {
     await this.createOrUpdateCard();
   }
 
-  async turnStarted(turnId: string): Promise<void> {
+  async turnStarted(): Promise<void> {
     this.status = "running";
-    this.activeTurnId = turnId;
     this.current = "Codex 正在处理";
-    this.addActivity("任务已开始");
     await this.createOrUpdateCard();
   }
 
-  appendAgentDelta(delta: string): void {
+  async agentDelta(delta: string, messagePhase?: CodexAgentMessagePhase | null, itemId?: string): Promise<void> {
+    if (messagePhase === "commentary") {
+      if (itemId && this.progressItemId !== itemId) {
+        this.progressItemId = itemId;
+        this.progressDraft = "";
+      }
+      this.progressDraft += delta;
+      await this.flushProgressDraft(false);
+      return;
+    }
     this.agentText += delta;
   }
 
   async planUpdated(_explanation: string | null | undefined, steps: CodexPlanStep[]): Promise<void> {
     this.plan.splice(0, this.plan.length, ...steps);
-    this.current = "计划已更新";
     await this.createOrUpdateCard();
   }
 
-  async itemStarted(item: CodexItemSummary): Promise<void> {
-    this.current = startedText(item);
-    this.addActivity(`开始：${itemActivityText(item)}`);
-    await this.createOrUpdateCard();
+  recordItemStarted(item: CodexItemSummary): void {
+    if (item.type === "agent_message" && item.messagePhase === "commentary") {
+      if (this.progressItemId !== item.id) {
+        this.progressItemId = item.id;
+        this.progressDraft = item.text ?? "";
+      } else if (!this.progressDraft && item.text) {
+        this.progressDraft = item.text;
+      }
+    }
   }
 
   async itemCompleted(item: CodexItemSummary): Promise<void> {
-    if (item.type === "agent_message" && item.text) this.agentText = item.text;
+    if (item.type === "agent_message" && item.text) {
+      if (item.messagePhase === "commentary") {
+        this.progressItemId = item.id;
+        this.progressDraft = item.text;
+        await this.flushProgressDraft(true);
+      } else {
+        this.agentText = item.text;
+      }
+    }
     if (item.type === "command_execution") this.commandCount += 1;
     if (item.type === "mcp_tool_call" || item.type === "dynamic_tool_call") this.toolCount += 1;
     for (const file of item.changedFiles ?? []) this.changedFiles.add(file);
-
-    this.current = completedText(item);
-    this.addActivity(`完成：${itemActivityText(item)}`);
-    await this.createOrUpdateCard();
   }
 
   async diffUpdated(changedFiles: string[]): Promise<void> {
-    for (const file of changedFiles) this.changedFiles.add(file);
-    if (changedFiles.length > 0) {
-      this.current = `检测到 ${changedFiles.length} 个文件变更`;
+    const before = this.changedFiles.size;
+    for (const file of changedFiles) {
+      this.changedFiles.add(file);
+    }
+    const addedCount = this.changedFiles.size - before;
+    if (addedCount > 0) {
+      this.current = `检测到 ${addedCount} 个文件变更`;
       await this.createOrUpdateCard();
     }
   }
@@ -75,13 +99,12 @@ export class TurnStatusReporter {
     this.status = "waiting_approval";
     this.current = title;
     this.approvalCount += 1;
-    this.addActivity(`等待审批：${title}`);
     await this.createOrUpdateCard();
   }
 
-  async warning(message: string): Promise<void> {
+  async warning(): Promise<void> {
     this.warningCount += 1;
-    this.addActivity(`提示：${message}`);
+    this.current = "Codex 返回提示";
     await this.createOrUpdateCard();
   }
 
@@ -89,7 +112,6 @@ export class TurnStatusReporter {
     this.lastTurnStatus = status;
     this.status = statusToCardStatus(status);
     this.current = statusToCurrentText(status);
-    this.addActivity(this.current);
     await this.createOrUpdateCard();
   }
 
@@ -97,7 +119,6 @@ export class TurnStatusReporter {
     this.lastTurnStatus = "failed";
     this.status = "failed";
     this.current = message;
-    this.addActivity(`失败：${message}`);
     await this.createOrUpdateCard();
   }
 
@@ -109,19 +130,13 @@ export class TurnStatusReporter {
     return this.lastTurnStatus;
   }
 
-  private addActivity(activity: string): void {
-    this.recentActivities.unshift(truncate(activity, 120));
-    this.recentActivities.splice(5);
-  }
-
   private async createOrUpdateCard(): Promise<void> {
     const card = renderTurnStatusCard({
       projectKey: this.projectKey,
       status: this.status,
       current: this.current,
-      activeTurnId: this.activeTurnId,
+      progressText: this.progressText,
       plan: this.plan,
-      recentActivities: this.recentActivities,
       changedFiles: [...this.changedFiles],
       commandCount: this.commandCount,
       toolCount: this.toolCount,
@@ -140,15 +155,37 @@ export class TurnStatusReporter {
       console.error("Failed to update Codex status card", error);
     }
   }
+
+  private async flushProgressDraft(force: boolean): Promise<void> {
+    const text = normalizeProgressText(this.progressDraft);
+    if (!text) return;
+    if (!force && text.length < MIN_PROGRESS_DELTA_LENGTH && !endsWithSentenceBoundary(text)) return;
+    await this.updateProgress(text, force);
+  }
+
+  private async updateProgress(text: string, force: boolean): Promise<void> {
+    const progress = normalizeProgressText(text);
+    if (!progress || progress === this.progressText) return;
+
+    const now = Date.now();
+    if (!force && this.lastProgressCardAt > 0 && now - this.lastProgressCardAt < PROGRESS_UPDATE_INTERVAL_MS) {
+      return;
+    }
+
+    this.progressText = progress;
+    if (this.status === "queued") this.status = "running";
+    if (this.current === "等待 Codex 开始处理") this.current = "Codex 正在处理";
+    this.lastProgressCardAt = now;
+    await this.createOrUpdateCard();
+  }
 }
 
 type TurnCardState = {
   projectKey: string;
   status: CardStatus;
   current: string;
-  activeTurnId: string | null;
+  progressText: string;
   plan: CodexPlanStep[];
-  recentActivities: string[];
   changedFiles: string[];
   commandCount: number;
   toolCount: number;
@@ -160,7 +197,6 @@ function renderTurnStatusCard(state: TurnCardState): object {
   const summary = [
     `**状态**：${statusLabel(state.status)}`,
     `**项目**：${state.projectKey}`,
-    state.activeTurnId ? `**Turn**：${state.activeTurnId}` : null,
     `**当前**：${truncate(state.current, 160)}`,
     `**活动摘要**：命令 ${state.commandCount} 个，工具 ${state.toolCount} 个，文件 ${state.changedFiles.length} 个，审批 ${state.approvalCount} 个`,
     state.warningCount > 0 ? `**提示**：${state.warningCount} 条` : null,
@@ -172,6 +208,17 @@ function renderTurnStatusCard(state: TurnCardState): object {
       text: { tag: "lark_md", content: summary },
     },
   ];
+
+  if (state.progressText) {
+    elements.push({ tag: "hr" });
+    elements.push({
+      tag: "div",
+      text: {
+        tag: "lark_md",
+        content: ["**阶段反馈**", truncate(state.progressText, 280)].join("\n"),
+      },
+    });
+  }
 
   if (state.plan.length > 0) {
     elements.push({ tag: "hr" });
@@ -198,17 +245,6 @@ function renderTurnStatusCard(state: TurnCardState): object {
     });
   }
 
-  if (state.recentActivities.length > 0) {
-    elements.push({ tag: "hr" });
-    elements.push({
-      tag: "div",
-      text: {
-        tag: "lark_md",
-        content: ["**最近活动**", ...state.recentActivities.map((activity) => `- ${activity}`)].join("\n"),
-      },
-    });
-  }
-
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -217,44 +253,6 @@ function renderTurnStatusCard(state: TurnCardState): object {
     },
     elements,
   };
-}
-
-function startedText(item: CodexItemSummary): string {
-  switch (item.type) {
-    case "reasoning":
-      return "Codex 正在分析";
-    case "command_execution":
-      return `正在执行命令：${truncate(item.command ?? item.title, 120)}`;
-    case "file_change":
-      return "正在修改文件";
-    case "mcp_tool_call":
-    case "dynamic_tool_call":
-      return `正在调用工具：${item.toolName ?? item.title}`;
-    case "web_search":
-      return item.title;
-    case "agent_message":
-      return "正在生成回复";
-    default:
-      return item.title;
-  }
-}
-
-function completedText(item: CodexItemSummary): string {
-  if (item.type === "command_execution") {
-    const exitText = item.exitCode === null || item.exitCode === undefined ? "" : `，退出码 ${item.exitCode}`;
-    return `命令执行完成${exitText}`;
-  }
-  if (item.type === "file_change") {
-    return `文件修改完成：${item.changedFiles?.length ?? 0} 个文件`;
-  }
-  if (item.type === "agent_message") return "回复已生成";
-  return `${itemActivityText(item)} 已完成`;
-}
-
-function itemActivityText(item: CodexItemSummary): string {
-  if (item.type === "command_execution") return truncate(item.command ?? item.title, 120);
-  if (item.type === "file_change") return `${item.changedFiles?.length ?? 0} 个文件变更`;
-  return truncate(item.toolName ?? item.title, 120);
 }
 
 function statusToCardStatus(status: string): CardStatus {
@@ -312,4 +310,12 @@ function planMarker(status: CodexPlanStep["status"]): string {
 
 function truncate(text: string, maxLength: number): string {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 1)}...`;
+}
+
+function normalizeProgressText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function endsWithSentenceBoundary(text: string): boolean {
+  return /[。！？.!?]$/.test(text);
 }

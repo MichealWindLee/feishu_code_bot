@@ -1,4 +1,4 @@
-import type { CodexItemSummary, CodexPlanStep } from "./types.js";
+import type { CodexAgentMessagePhase, CodexItemSummary, CodexPlanStep } from "./types.js";
 
 export function readPlanSteps(params: Record<string, unknown> | undefined): CodexPlanStep[] {
   const plan = Array.isArray(params?.plan) ? params.plan : [];
@@ -25,7 +25,7 @@ export function summarizeItem(item: unknown): CodexItemSummary {
         type: "agent_message",
         title: "Agent response",
         text: typeof record.text === "string" ? record.text : undefined,
-        status: typeof record.phase === "string" ? record.phase : undefined,
+        messagePhase: readMessagePhase(record.phase),
       };
     case "reasoning":
       return { id, type: "reasoning", title: "Reasoning" };
@@ -114,6 +114,12 @@ export function readTurnStatus(params: Record<string, unknown> | undefined): str
 
 function readPlanStepStatus(status: unknown): CodexPlanStep["status"] {
   return status === "pending" || status === "inProgress" || status === "completed" ? status : "pending";
+}
+
+function readMessagePhase(phase: unknown): CodexAgentMessagePhase | null | undefined {
+  if (phase === "commentary" || phase === "final_answer") return phase;
+  if (phase === null) return null;
+  return undefined;
 }
 
 function readChangedFiles(changes: unknown): string[] {

@@ -45,7 +45,7 @@ describe("BotService", () => {
     expect(messages.markdown[0]).toContain("已收到");
   });
 
-  it("renders turn status cards from plan and item events", async () => {
+  it("renders low-noise turn status cards from plan and file changes", async () => {
     const { service, messages } = makeHarness([
       { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
       {
@@ -81,6 +81,7 @@ describe("BotService", () => {
         },
       },
       { type: "diff_updated", threadId: "thread-1", turnId: "turn-1", diff: "", changedFiles: ["src/foo.ts"] },
+      { type: "diff_updated", threadId: "thread-1", turnId: "turn-1", diff: "", changedFiles: ["src/foo.ts"] },
       {
         type: "item_completed",
         threadId: "thread-1",
@@ -95,9 +96,116 @@ describe("BotService", () => {
 
     const cardText = JSON.stringify([...messages.cards, ...messages.cardUpdates.map((update) => update.card)]);
     expect(cardText).toContain("Run tests");
-    expect(cardText).toContain("pnpm test");
+    expect(cardText).toContain("命令 1 个");
     expect(cardText).toContain("src/foo.ts");
+    expect(cardText).not.toContain("正在执行命令");
+    expect(cardText).not.toContain("pnpm test");
+    expect(cardText).not.toContain("最近活动");
+    expect(cardText).not.toContain("Turn");
+    expect(messages.cardUpdates).toHaveLength(4);
     expect(messages.markdown.at(-1)).toBe("final answer");
+  });
+
+  it("renders commentary as stage feedback without mixing it into the final reply", async () => {
+    const { service, messages } = makeHarness([
+      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      {
+        type: "item_started",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-commentary",
+          type: "agent_message",
+          title: "Agent response",
+          messagePhase: "commentary",
+          text: "",
+        },
+      },
+      {
+        type: "agent_delta",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-commentary",
+        messagePhase: "commentary",
+        delta: "我先看一下代码结构。",
+      },
+      {
+        type: "item_completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-commentary",
+          type: "agent_message",
+          title: "Agent response",
+          messagePhase: "commentary",
+          text: "我先看一下代码结构。",
+        },
+      },
+      {
+        type: "item_completed",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-final",
+          type: "agent_message",
+          title: "Agent response",
+          messagePhase: "final_answer",
+          text: "final answer",
+        },
+      },
+      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+    ]);
+
+    await service.handleEvent(message("explain progress"));
+    await service.waitForIdle();
+
+    const cardText = JSON.stringify([...messages.cards, ...messages.cardUpdates.map((update) => update.card)]);
+    expect(cardText).toContain("阶段反馈");
+    expect(cardText).toContain("我先看一下代码结构。");
+    expect(messages.markdown.at(-1)).toBe("final answer");
+    expect(messages.markdown.join("\n")).not.toContain("我先看一下代码结构。");
+  });
+
+  it("does not reset accumulated commentary when item_started arrives after a delta", async () => {
+    const { service, messages } = makeHarness([
+      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      {
+        type: "agent_delta",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-commentary",
+        messagePhase: "commentary",
+        delta: "我先看",
+      },
+      {
+        type: "item_started",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          id: "item-commentary",
+          type: "agent_message",
+          title: "Agent response",
+          messagePhase: "commentary",
+          text: "",
+        },
+      },
+      {
+        type: "agent_delta",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-commentary",
+        messagePhase: "commentary",
+        delta: "代码。",
+      },
+      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+    ]);
+
+    await service.handleEvent(message("explain progress"));
+    await service.waitForIdle();
+
+    const cardText = JSON.stringify([...messages.cards, ...messages.cardUpdates.map((update) => update.card)]);
+    expect(cardText).toContain("我先看代码。");
+    expect(cardText).not.toContain("阶段反馈\\n代码。");
   });
 
   it("blocks ordinary messages when a turn is active", async () => {

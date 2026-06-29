@@ -234,7 +234,7 @@ export class BotService {
   ): Promise<void> {
     switch (event.type) {
       case "turn_started": {
-        await reporter.turnStarted(event.turnId);
+        await reporter.turnStarted();
         const result = await this.sessions.markTurnStarted(claim, event.threadId, event.turnId);
         if (result.shouldInterrupt) {
           await this.codex.interruptTurn({ threadId: event.threadId, turnId: event.turnId }).catch(() => undefined);
@@ -242,13 +242,13 @@ export class BotService {
         break;
       }
       case "agent_delta":
-        reporter.appendAgentDelta(event.delta);
+        await reporter.agentDelta(event.delta, event.messagePhase, event.itemId);
         break;
       case "plan_updated":
         await reporter.planUpdated(event.explanation, event.steps);
         break;
       case "item_started":
-        await reporter.itemStarted(event.item);
+        reporter.recordItemStarted(event.item);
         break;
       case "item_completed":
         await reporter.itemCompleted(event.item);
@@ -287,7 +287,7 @@ export class BotService {
         await this.sessions.completeTurn(claim, event.turnId);
         break;
       case "warning":
-        await reporter.warning(event.message);
+        await reporter.warning();
         break;
       case "error":
         await reporter.fail(event.message);

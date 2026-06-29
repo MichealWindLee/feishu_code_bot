@@ -39,6 +39,7 @@ export interface CodexApprovalRequest {
 }
 
 export type CodexPlanStepStatus = "pending" | "inProgress" | "completed";
+export type CodexAgentMessagePhase = "commentary" | "final_answer";
 
 export interface CodexPlanStep {
   step: string;
@@ -62,6 +63,7 @@ export interface CodexItemSummary {
   type: CodexItemType;
   title: string;
   status?: string;
+  messagePhase?: CodexAgentMessagePhase | null;
   text?: string;
   command?: string;
   cwd?: string;
@@ -73,7 +75,14 @@ export interface CodexItemSummary {
 
 export type CodexEvent =
   | { type: "turn_started"; threadId: string; turnId: string }
-  | { type: "agent_delta"; threadId: string; turnId: string; delta: string }
+  | {
+      type: "agent_delta";
+      threadId: string;
+      turnId: string;
+      delta: string;
+      itemId?: string;
+      messagePhase?: CodexAgentMessagePhase | null;
+    }
   | { type: "plan_updated"; threadId: string; turnId: string; explanation?: string | null; steps: CodexPlanStep[] }
   | { type: "item_started"; threadId: string; turnId: string; item: CodexItemSummary }
   | { type: "item_completed"; threadId: string; turnId: string; item: CodexItemSummary }

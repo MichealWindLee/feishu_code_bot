@@ -64,9 +64,21 @@ describe("CodexAppServerDriver", () => {
       changedFiles: ["src/foo.ts"],
     });
     expect((await iterator.next()).value).toEqual({
+      type: "item_started",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: expect.objectContaining({
+        id: "item-commentary",
+        type: "agent_message",
+        messagePhase: "commentary",
+      }),
+    });
+    expect((await iterator.next()).value).toEqual({
       type: "agent_delta",
       threadId: "thread-1",
       turnId: "turn-1",
+      itemId: "item-commentary",
+      messagePhase: "commentary",
       delta: "hello",
     });
 
@@ -180,10 +192,21 @@ rl.on("line", (line) => {
       turnId: "turn-1",
       diff: "diff --git a/src/foo.ts b/src/foo.ts\\n"
     }});
+    send({ method: "item/started", params: {
+      threadId: message.params.threadId,
+      turnId: "turn-1",
+      item: {
+        type: "agentMessage",
+        id: "item-commentary",
+        text: "",
+        phase: "commentary",
+        memoryCitation: null
+      }
+    }});
     send({ method: "item/agentMessage/delta", params: {
       threadId: message.params.threadId,
       turnId: "turn-1",
-      itemId: "item-1",
+      itemId: "item-commentary",
       delta: "hello"
     }});
     send({ id: "approval-1", method: "item/commandExecution/requestApproval", params: {

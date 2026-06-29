@@ -12,8 +12,10 @@ import {
   summarizeItem,
 } from "./app-server-events.js";
 import type {
+  CodexAgentMessagePhase,
   CodexDriver,
   CodexEvent,
+  CodexItemSummary,
   CodexThread,
   InterruptTurnInput,
   ResolveApprovalInput,
@@ -44,6 +46,7 @@ export class CodexAppServerDriver implements CodexDriver {
   private readonly turnQueues = new Map<string, AsyncQueue<CodexEvent>>();
   private readonly turnThreadIds = new Map<string, string>();
   private readonly bufferedTurnEvents = new Map<string, CodexEvent[]>();
+  private readonly agentMessagePhases = new Map<string, CodexAgentMessagePhase | null>();
   private initialized = false;
 
   constructor(private readonly config: AppConfig) {}
@@ -62,6 +65,7 @@ export class CodexAppServerDriver implements CodexDriver {
       this.turnQueues.clear();
       this.turnThreadIds.clear();
       this.bufferedTurnEvents.clear();
+      this.agentMessagePhases.clear();
       this.proc = null;
       this.initialized = false;
     });
@@ -222,10 +226,13 @@ export class CodexAppServerDriver implements CodexDriver {
       }
       case "item/agentMessage/delta": {
         if (turnId) {
+          const itemId = typeof params?.itemId === "string" ? params.itemId : undefined;
           this.pushTurnEvent(turnId, {
             type: "agent_delta",
             threadId: String(params?.threadId ?? ""),
             turnId,
+            itemId,
+            messagePhase: itemId ? this.agentMessagePhases.get(itemId) : undefined,
             delta: String(params?.delta ?? ""),
           });
         }
@@ -245,23 +252,27 @@ export class CodexAppServerDriver implements CodexDriver {
       }
       case "item/started": {
         if (turnId) {
+          const item = summarizeItem((params as { item?: unknown } | undefined)?.item);
+          this.rememberAgentMessagePhase(item);
           this.pushTurnEvent(turnId, {
             type: "item_started",
             threadId: String(params?.threadId ?? ""),
             turnId,
-            item: summarizeItem((params as { item?: unknown } | undefined)?.item),
+            item,
           });
         }
         break;
       }
       case "item/completed": {
         if (turnId) {
+          const item = summarizeItem((params as { item?: unknown } | undefined)?.item);
           this.pushTurnEvent(turnId, {
             type: "item_completed",
             threadId: String(params?.threadId ?? ""),
             turnId,
-            item: summarizeItem((params as { item?: unknown } | undefined)?.item),
+            item,
           });
+          if (item.type === "agent_message") this.agentMessagePhases.delete(item.id);
         }
         break;
       }
@@ -369,6 +380,11 @@ export class CodexAppServerDriver implements CodexDriver {
     this.turnQueues.clear();
     this.turnThreadIds.clear();
     this.bufferedTurnEvents.clear();
+    this.agentMessagePhases.clear();
+  }
+
+  private rememberAgentMessagePhase(item: CodexItemSummary): void {
+    if (item.type === "agent_message") this.agentMessagePhases.set(item.id, item.messagePhase ?? null);
   }
 }
 
