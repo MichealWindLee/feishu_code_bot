@@ -1,2 +1,14 @@
 log/
+todo/
 .DS_Store
+node_modules/
+dist/
+data/
+.env
+config.local.json
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

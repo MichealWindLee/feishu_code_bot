@@ -1,0 +1,31 @@
+{
+  "feishu": {
+    "appId": "cli_xxx",
+    "appSecret": "xxx",
+    "botOpenId": "ou_xxx",
+    "allowedUsers": ["ou_user_xxx"],
+    "allowedChats": []
+  },
+  "projects": [
+    {
+      "key": "bot",
+      "name": "Feishu Codex Bot",
+      "path": ".",
+      "sandbox": "workspace-write",
+      "approvalPolicy": "on-request"
+    }
+  ],
+  "codex": {
+    "binaryPath": "codex",
+    "defaultSandbox": "workspace-write",
+    "defaultApprovalPolicy": "on-request"
+  },
+  "storage": {
+    "sqlitePath": "./data/bot.sqlite"
+  },
+  "bot": {
+    "approvalTtlMs": 1800000,
+    "eventDedupTtlMs": 86400000,
+    "debugPromptAcceptedFeedback": false
+  }
+}
