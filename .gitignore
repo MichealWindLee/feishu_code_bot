@@ -3,6 +3,7 @@ todo/
 .DS_Store
 node_modules/
 dist/
+data/
 .env
 config.local.json
 *.db
