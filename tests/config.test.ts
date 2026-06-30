@@ -34,6 +34,44 @@ describe("config", () => {
     expect(config.bot.debugPromptAcceptedFeedback).toBe(true);
   });
 
+  it("loads explicit agent config", () => {
+    const configPath = writeTempConfig({
+      agent: {
+        type: "codex",
+        binaryPath: "/bin/codex",
+        defaultSandbox: "workspace-write",
+        defaultApprovalPolicy: "on-request",
+      },
+    });
+
+    const config = loadConfig({ configPath });
+
+    expect(config.agent).toEqual(expect.objectContaining({
+      type: "codex",
+      binaryPath: "/bin/codex",
+    }));
+  });
+
+  it("keeps agent metadata out of config normalization", () => {
+    const configPath = writeTempConfig({
+      agent: {
+        type: "codex",
+        binaryPath: "codex",
+        defaultSandbox: "workspace-write",
+        defaultApprovalPolicy: "on-request",
+      },
+    });
+
+    const config = loadConfig({ configPath });
+
+    expect(config.agent).toEqual(expect.objectContaining({
+      type: "codex",
+      binaryPath: "codex",
+    }));
+    expect(config.agent).not.toHaveProperty("id");
+    expect(config.agent).not.toHaveProperty("displayName");
+  });
+
   it("loads process env from a dotenv file before applying env overrides", () => {
     const configPath = writeTempConfig({
       feishu: {
@@ -69,7 +107,8 @@ function writeTempConfig(overrides: Record<string, unknown>): string {
       allowedChats: [],
     },
     projects: [{ key: "bot", name: "Bot", path: "." }],
-    codex: {
+    agent: {
+      type: "codex",
       binaryPath: "codex",
       defaultSandbox: "workspace-write",
       defaultApprovalPolicy: "on-request",

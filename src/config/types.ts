@@ -1,5 +1,15 @@
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
+export const AGENT_TYPES = ["codex"] as const;
+export type AgentType = (typeof AGENT_TYPES)[number];
+
+export interface AgentConfig {
+  type: AgentType;
+  binaryPath: string;
+  defaultSandbox: SandboxMode;
+  defaultApprovalPolicy: ApprovalPolicy;
+  model?: string;
+}
 
 export interface ProjectConfig {
   key: string;
@@ -19,12 +29,7 @@ export interface AppConfig {
     allowedChats: string[];
   };
   projects: ProjectConfig[];
-  codex: {
-    binaryPath: string;
-    defaultSandbox: SandboxMode;
-    defaultApprovalPolicy: ApprovalPolicy;
-    model?: string;
-  };
+  agent: AgentConfig;
   storage: {
     sqlitePath: string;
   };

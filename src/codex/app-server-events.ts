@@ -1,8 +1,8 @@
-import type { CodexAgentMessagePhase, CodexItemSummary, CodexPlanStep } from "./types.js";
+import type { AgentItemSummary, AgentMessagePhase, AgentPlanStep } from "../agent/types.js";
 
-export function readPlanSteps(params: Record<string, unknown> | undefined): CodexPlanStep[] {
+export function readPlanSteps(params: Record<string, unknown> | undefined): AgentPlanStep[] {
   const plan = Array.isArray(params?.plan) ? params.plan : [];
-  return plan.map((step): CodexPlanStep => {
+  return plan.map((step): AgentPlanStep => {
     const record = asRecord(step);
     return {
       step: stringOr(record?.step, "(unknown step)"),
@@ -11,7 +11,7 @@ export function readPlanSteps(params: Record<string, unknown> | undefined): Code
   });
 }
 
-export function summarizeItem(item: unknown): CodexItemSummary {
+export function summarizeItem(item: unknown): AgentItemSummary {
   const record = asRecord(item);
   if (!record) return { id: "unknown", type: "other", title: "Codex activity" };
 
@@ -112,11 +112,11 @@ export function readTurnStatus(params: Record<string, unknown> | undefined): str
   return turn?.status ?? "completed";
 }
 
-function readPlanStepStatus(status: unknown): CodexPlanStep["status"] {
+function readPlanStepStatus(status: unknown): AgentPlanStep["status"] {
   return status === "pending" || status === "inProgress" || status === "completed" ? status : "pending";
 }
 
-function readMessagePhase(phase: unknown): CodexAgentMessagePhase | null | undefined {
+function readMessagePhase(phase: unknown): AgentMessagePhase | null | undefined {
   if (phase === "commentary" || phase === "final_answer") return phase;
   if (phase === null) return null;
   return undefined;

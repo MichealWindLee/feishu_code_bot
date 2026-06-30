@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { CodexAppServerDriver } from "../src/codex/app-server-driver.js";
-import type { CodexEvent } from "../src/codex/types.js";
+import type { AgentRunEvent } from "../src/agent/types.js";
 import type { AppConfig } from "../src/config/types.js";
 
 describe("CodexAppServerDriver", () => {
@@ -19,15 +19,16 @@ describe("CodexAppServerDriver", () => {
     driver = new CodexAppServerDriver(testConfig(binaryPath));
 
     await driver.start();
-    const thread = await driver.startThread({ project: testProject() });
-    expect(thread.id).toBe("thread-1");
-    await expect(driver.resumeThread("thread-1", { threadId: "thread-1", project: testProject() })).resolves.toEqual({
+    const session = await driver.createSession({ project: testProject() });
+    expect(session).toEqual({ id: "thread-1", resumeSupported: true });
+    await expect(driver.resumeSession({ sessionId: "thread-1", project: testProject() })).resolves.toEqual({
       id: "thread-1",
+      resumeSupported: true,
     });
 
     const iterator = driver
-      .startTurn({
-        threadId: "thread-1",
+      .startRun({
+        sessionId: "thread-1",
         project: testProject(),
         text: "please test",
         clientUserMessageId: "message-1",
@@ -35,21 +36,21 @@ describe("CodexAppServerDriver", () => {
       [Symbol.asyncIterator]();
 
     expect((await iterator.next()).value).toEqual({
-      type: "turn_started",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      type: "run_started",
+      sessionId: "thread-1",
+      runId: "turn-1",
     });
     expect((await iterator.next()).value).toEqual({
       type: "plan_updated",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      sessionId: "thread-1",
+      runId: "turn-1",
       explanation: null,
       steps: [{ step: "Run tests", status: "inProgress" }],
     });
     expect((await iterator.next()).value).toEqual({
       type: "item_started",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      sessionId: "thread-1",
+      runId: "turn-1",
       item: expect.objectContaining({
         id: "item-cmd",
         type: "command_execution",
@@ -58,15 +59,15 @@ describe("CodexAppServerDriver", () => {
     });
     expect((await iterator.next()).value).toEqual({
       type: "diff_updated",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      sessionId: "thread-1",
+      runId: "turn-1",
       diff: "diff --git a/src/foo.ts b/src/foo.ts\n",
       changedFiles: ["src/foo.ts"],
     });
     expect((await iterator.next()).value).toEqual({
       type: "item_started",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      sessionId: "thread-1",
+      runId: "turn-1",
       item: expect.objectContaining({
         id: "item-commentary",
         type: "agent_message",
@@ -75,14 +76,14 @@ describe("CodexAppServerDriver", () => {
     });
     expect((await iterator.next()).value).toEqual({
       type: "agent_delta",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      sessionId: "thread-1",
+      runId: "turn-1",
       itemId: "item-commentary",
       messagePhase: "commentary",
       delta: "hello",
     });
 
-    const approvalEvent = (await iterator.next()).value as Extract<CodexEvent, { type: "approval_requested" }>;
+    const approvalEvent = (await iterator.next()).value as Extract<AgentRunEvent, { type: "approval_requested" }>;
     expect(approvalEvent.approval.kind).toBe("command");
     expect(approvalEvent.approval.body).toContain("pnpm test");
 
@@ -94,13 +95,13 @@ describe("CodexAppServerDriver", () => {
     });
 
     expect((await iterator.next()).value).toEqual({
-      type: "turn_completed",
-      threadId: "thread-1",
-      turnId: "turn-1",
+      type: "run_completed",
+      sessionId: "thread-1",
+      runId: "turn-1",
       status: "completed",
     });
     expect((await iterator.next()).done).toBe(true);
-    await expect(driver.interruptTurn({ threadId: "thread-1", turnId: "turn-1" })).resolves.toBeUndefined();
+    await expect(driver.interruptRun({ sessionId: "thread-1", runId: "turn-1" })).resolves.toBeUndefined();
   });
 });
 
@@ -113,7 +114,8 @@ function testConfig(binaryPath: string): AppConfig {
       allowedChats: [],
     },
     projects: [testProject()],
-    codex: {
+    agent: {
+      type: "codex",
       binaryPath,
       defaultSandbox: "workspace-write",
       defaultApprovalPolicy: "on-request",
