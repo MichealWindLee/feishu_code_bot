@@ -9,13 +9,14 @@
   "projects": [
     {
       "key": "bot",
-      "name": "Feishu Codex Bot",
+      "name": "Feishu Code Agent Bot",
       "path": ".",
       "sandbox": "workspace-write",
       "approvalPolicy": "on-request"
     }
   ],
-  "codex": {
+  "agent": {
+    "type": "codex",
     "binaryPath": "codex",
     "defaultSandbox": "workspace-write",
     "defaultApprovalPolicy": "on-request"
