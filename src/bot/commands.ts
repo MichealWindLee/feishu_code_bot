@@ -46,17 +46,17 @@ export function parseCommand(input: string): BotCommand | null {
   }
 }
 
-export function commandHelp(): string {
+export function commandHelp(agentDisplayName = "Code Agent"): string {
   return [
-    "Feishu Codex Bot commands:",
+    `Feishu ${agentDisplayName} Bot commands:`,
     "- /projects: list configured projects",
     "- /use <project>: switch your current project",
-    "- /new: start a fresh Codex session",
-    "- /end: end your current Codex session",
+    `- /new: start a fresh ${agentDisplayName} session`,
+    `- /end: end your current ${agentDisplayName} session`,
     "- /status: show current session status",
-    "- /stop: interrupt the active Codex turn",
-    "- /permissions: show current Codex permission policy",
-    "- /approve <id>: approve a pending Codex request",
-    "- /deny <id>: deny a pending Codex request",
+    `- /stop: interrupt the active ${agentDisplayName} run when supported`,
+    `- /permissions: show current ${agentDisplayName} permission policy`,
+    `- /approve <id>: approve a pending ${agentDisplayName} request`,
+    `- /deny <id>: deny a pending ${agentDisplayName} request`,
   ].join("\n");
 }

@@ -1,16 +1,21 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BotService } from "../src/bot/bot-service.js";
+import type {
+  AgentCapabilities,
+  AgentRunEvent,
+  AgentSession,
+  CodeAgentDriver,
+  CreateAgentSessionInput,
+  InterruptAgentRunInput,
+  ResolveAgentApprovalInput,
+  ResumeAgentSessionInput,
+  StartAgentRunInput,
+} from "../src/agent/types.js";
 import { SqliteStateStore } from "../src/store/sqlite-state-store.js";
 import type { AppConfig } from "../src/config/types.js";
-import type {
-  CodexDriver,
-  CodexEvent,
-  CodexThread,
-  InterruptTurnInput,
-  ResolveApprovalInput,
-  StartThreadInput,
-  StartTurnInput,
-} from "../src/codex/types.js";
 import type {
   FeishuGateway,
   FeishuInboundEvent,
@@ -18,19 +23,16 @@ import type {
   ReplyTarget,
   SendResult,
 } from "../src/feishu/types.js";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 describe("BotService", () => {
-  it("runs the main prompt flow with turn/start semantics", async () => {
-    const { service, messages, codex } = makeHarness();
+  it("runs the main prompt flow with agent run semantics", async () => {
+    const { service, messages, agent } = makeHarness();
 
-    await service.handleEvent(message("hello codex"));
+    await service.handleEvent(message("hello agent"));
     await service.waitForIdle();
 
-    expect(codex.startedThreads).toHaveLength(1);
-    expect(codex.turnInputs.map((input) => input.text)).toEqual(["hello codex"]);
+    expect(agent.createdSessions).toHaveLength(1);
+    expect(agent.runInputs.map((input) => input.text)).toEqual(["hello agent"]);
     expect(messages.cards).toHaveLength(1);
     expect(messages.cardUpdates.length).toBeGreaterThan(0);
     expect(messages.markdown.at(-1)).toBe("done");
@@ -39,26 +41,27 @@ describe("BotService", () => {
   it("sends prompt accepted feedback only when debug is enabled", async () => {
     const { service, messages } = makeHarness(undefined, { debugPromptAcceptedFeedback: true });
 
-    await service.handleEvent(message("hello codex"));
+    await service.handleEvent(message("hello agent"));
     await service.waitForIdle();
 
     expect(messages.markdown[0]).toContain("已收到");
+    expect(messages.markdown[0]).toContain("Test Agent");
   });
 
-  it("renders low-noise turn status cards from plan and file changes", async () => {
+  it("renders low-noise run status cards from plan and file changes", async () => {
     const { service, messages } = makeHarness([
-      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      { type: "run_started", sessionId: "session-1", runId: "run-1" },
       {
         type: "plan_updated",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         explanation: null,
         steps: [{ step: "Run tests", status: "inProgress" }],
       },
       {
         type: "item_started",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-1",
           type: "command_execution",
@@ -69,8 +72,8 @@ describe("BotService", () => {
       },
       {
         type: "item_completed",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-1",
           type: "command_execution",
@@ -80,15 +83,15 @@ describe("BotService", () => {
           exitCode: 0,
         },
       },
-      { type: "diff_updated", threadId: "thread-1", turnId: "turn-1", diff: "", changedFiles: ["src/foo.ts"] },
-      { type: "diff_updated", threadId: "thread-1", turnId: "turn-1", diff: "", changedFiles: ["src/foo.ts"] },
+      { type: "diff_updated", sessionId: "session-1", runId: "run-1", diff: "", changedFiles: ["src/foo.ts"] },
+      { type: "diff_updated", sessionId: "session-1", runId: "run-1", diff: "", changedFiles: ["src/foo.ts"] },
       {
         type: "item_completed",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: { id: "item-2", type: "agent_message", title: "Agent response", text: "final answer" },
       },
-      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
     ]);
 
     await service.handleEvent(message("run tests"));
@@ -108,11 +111,11 @@ describe("BotService", () => {
 
   it("renders commentary as stage feedback without mixing it into the final reply", async () => {
     const { service, messages } = makeHarness([
-      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      { type: "run_started", sessionId: "session-1", runId: "run-1" },
       {
         type: "item_started",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-commentary",
           type: "agent_message",
@@ -123,16 +126,16 @@ describe("BotService", () => {
       },
       {
         type: "agent_delta",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         itemId: "item-commentary",
         messagePhase: "commentary",
         delta: "我先看一下代码结构。",
       },
       {
         type: "item_completed",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-commentary",
           type: "agent_message",
@@ -143,8 +146,8 @@ describe("BotService", () => {
       },
       {
         type: "item_completed",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-final",
           type: "agent_message",
@@ -153,7 +156,7 @@ describe("BotService", () => {
           text: "final answer",
         },
       },
-      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
     ]);
 
     await service.handleEvent(message("explain progress"));
@@ -168,19 +171,19 @@ describe("BotService", () => {
 
   it("does not reset accumulated commentary when item_started arrives after a delta", async () => {
     const { service, messages } = makeHarness([
-      { type: "turn_started", threadId: "thread-1", turnId: "turn-1" },
+      { type: "run_started", sessionId: "session-1", runId: "run-1" },
       {
         type: "agent_delta",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         itemId: "item-commentary",
         messagePhase: "commentary",
         delta: "我先看",
       },
       {
         type: "item_started",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         item: {
           id: "item-commentary",
           type: "agent_message",
@@ -191,13 +194,13 @@ describe("BotService", () => {
       },
       {
         type: "agent_delta",
-        threadId: "thread-1",
-        turnId: "turn-1",
+        sessionId: "session-1",
+        runId: "run-1",
         itemId: "item-commentary",
         messagePhase: "commentary",
         delta: "代码。",
       },
-      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
     ]);
 
     await service.handleEvent(message("explain progress"));
@@ -208,13 +211,13 @@ describe("BotService", () => {
     expect(cardText).not.toContain("阶段反馈\\n代码。");
   });
 
-  it("blocks ordinary messages when a turn is active", async () => {
+  it("blocks ordinary messages when a run is active", async () => {
     const { service, store, messages } = makeHarness();
     await store.upsertCurrentSession({
       userOpenId: "u1",
       projectKey: "bot",
-      codexThreadId: "thread-1",
-      activeTurnId: "turn-1",
+      agentSessionId: "session-1",
+      activeRunId: "run-1",
       lastChatId: "chat-1",
       updatedAt: Date.now(),
     });
@@ -226,20 +229,20 @@ describe("BotService", () => {
   });
 
   it("stores and resolves approval requests", async () => {
-    const { service, messages, codex } = makeHarness([
+    const { service, messages, agent } = makeHarness([
       {
         type: "approval_requested",
         approval: {
           kind: "command",
           requestId: 42,
-          threadId: "thread-1",
-          turnId: "turn-1",
+          sessionId: "session-1",
+          runId: "run-1",
           title: "Run command",
           body: "Command: pnpm test",
           raw: { requestId: 42, params: {} },
         },
       },
-      { type: "turn_completed", threadId: "thread-1", turnId: "turn-1", status: "completed" },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
     ]);
 
     await service.handleEvent(message("please test"));
@@ -252,65 +255,131 @@ describe("BotService", () => {
     await service.handleEvent(message(`/approve ${approvalId}`));
     await service.waitForIdle();
 
-    expect(codex.resolvedApprovals).toEqual([
+    expect(agent.resolvedApprovals).toEqual([
       expect.objectContaining({ approved: true, requestId: 42 }),
     ]);
   });
 
-  it("acks Feishu events before a slow Codex turn completes", async () => {
+  it("does not store approval requests when the agent does not support approvals", async () => {
+    const { service, messages, agent } = makeHarness(
+      [
+        {
+          type: "approval_requested",
+          approval: {
+            kind: "command",
+            requestId: 42,
+            sessionId: "session-1",
+            runId: "run-1",
+            title: "Run command",
+            body: "Command: pnpm test",
+            raw: { requestId: 42, params: {} },
+          },
+        },
+        { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
+      ],
+      {},
+      { approvals: false },
+    );
+
+    await service.handleEvent(message("please test"));
+    await service.waitForIdle();
+
+    expect(messages.markdown.join("\n")).not.toContain("/approve");
+    expect(messages.markdown.join("\n")).toContain("does not support remote approval");
+    expect(agent.resolvedApprovals).toEqual([]);
+  });
+
+  it("acks Feishu events before a slow agent run completes", async () => {
     const release = deferred<void>();
-    const { service, codex } = makeHarness(async function* (input) {
-      yield { type: "turn_started", threadId: input.threadId, turnId: "turn-1" };
+    const { service, agent } = makeHarness(async function* (input) {
+      yield { type: "run_started", sessionId: input.sessionId, runId: "run-1" };
       await release.promise;
-      yield { type: "agent_delta", threadId: input.threadId, turnId: "turn-1", delta: "done" };
-      yield { type: "turn_completed", threadId: input.threadId, turnId: "turn-1", status: "completed" };
+      yield { type: "agent_delta", sessionId: input.sessionId, runId: "run-1", delta: "done" };
+      yield { type: "run_completed", sessionId: input.sessionId, runId: "run-1", status: "completed" };
     });
 
     await expect(
       Promise.race([service.handleEvent(message("slow task")).then(() => "acked"), delay(20).then(() => "timeout")]),
     ).resolves.toBe("acked");
 
-    await waitUntil(() => codex.turnInputs.length === 1);
+    await waitUntil(() => agent.runInputs.length === 1);
     release.resolve();
     await service.waitForIdle();
   });
 
-  it("can process /stop while a Codex turn is still running", async () => {
+  it("can process /stop while an agent run is still running", async () => {
     const release = deferred<void>();
-    const { service, codex, messages, store } = makeHarness(async function* (input) {
-      yield { type: "turn_started", threadId: input.threadId, turnId: "turn-1" };
+    const { service, agent, messages, store } = makeHarness(async function* (input) {
+      yield { type: "run_started", sessionId: input.sessionId, runId: "run-1" };
       await release.promise;
-      yield { type: "turn_completed", threadId: input.threadId, turnId: "turn-1", status: "completed" };
+      yield { type: "run_completed", sessionId: input.sessionId, runId: "run-1", status: "completed" };
     });
 
     await service.handleEvent(message("long task"));
-    await waitUntil(() => codex.turnInputs.length === 1);
-    await waitUntil(async () => (await store.getCurrentSession("u1"))?.activeTurnId === "turn-1");
+    await waitUntil(() => agent.runInputs.length === 1);
+    await waitUntil(async () => (await store.getCurrentSession("u1"))?.activeRunId === "run-1");
 
     await service.handleEvent(message("/stop"));
-    await waitUntil(() => codex.interruptedTurns.length === 1);
+    await waitUntil(() => agent.interruptedRuns.length === 1);
 
-    expect(codex.interruptedTurns[0]).toEqual({ threadId: "thread-1", turnId: "turn-1" });
+    expect(agent.interruptedRuns[0]).toEqual({ sessionId: "session-1", runId: "run-1" });
     expect(messages.markdown.at(-1)).toContain("Stopped");
     release.resolve();
     await service.waitForIdle();
   });
 
-  it("ends the current Codex session and clears pending approvals", async () => {
-    const { service, codex, messages, store } = makeHarness();
+  it("reports unsupported /stop when the agent cannot interrupt runs", async () => {
+    const { service, agent, messages, store } = makeHarness(undefined, {}, { interruptRun: false });
     await store.upsertCurrentSession({
       userOpenId: "u1",
       projectKey: "bot",
-      codexThreadId: "thread-1",
-      activeTurnId: "turn-1",
+      agentSessionId: "session-1",
+      activeRunId: "run-1",
+      lastChatId: "chat-1",
+      updatedAt: Date.now(),
+    });
+
+    await service.handleEvent(message("/stop"));
+    await service.waitForIdle();
+
+    expect(agent.interruptedRuns).toEqual([]);
+    expect(messages.markdown.at(-1)).toContain("does not support remote task interruption");
+  });
+
+  it("creates a fresh session instead of resuming when the agent cannot resume sessions", async () => {
+    const { service, agent, store } = makeHarness(undefined, {}, { resumeSession: false });
+    await store.upsertCurrentSession({
+      userOpenId: "u1",
+      projectKey: "bot",
+      agentSessionId: "old-session",
+      activeRunId: null,
+      lastChatId: "chat-1",
+      updatedAt: Date.now(),
+    });
+
+    await service.handleEvent(message("new work after restart"));
+    await service.waitForIdle();
+
+    expect(agent.resumedSessions).toEqual([]);
+    expect(agent.createdSessions).toHaveLength(1);
+    expect(agent.runInputs[0].sessionId).toBe("session-1");
+  });
+
+  it("ends the current agent session and clears pending approvals", async () => {
+    const { service, agent, messages, store } = makeHarness();
+    await store.upsertCurrentSession({
+      userOpenId: "u1",
+      projectKey: "bot",
+      agentSessionId: "session-1",
+      activeRunId: "run-1",
       lastChatId: "chat-1",
       updatedAt: Date.now(),
     });
     await store.savePendingApproval({
       approvalShortId: "a1",
       userOpenId: "u1",
-      codexThreadId: "thread-1",
-      turnId: "turn-1",
+      agentSessionId: "session-1",
+      runId: "run-1",
       requestId: "9",
       approvalKind: "command",
       payloadJson: "{}",
@@ -320,24 +389,24 @@ describe("BotService", () => {
     await service.handleEvent(message("/end"));
     await service.waitForIdle();
 
-    expect(codex.interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-1" }]);
+    expect(agent.interruptedRuns).toEqual([{ sessionId: "session-1", runId: "run-1" }]);
     expect(await store.getPendingApproval("a1")).toBeNull();
     expect(await store.getCurrentSession("u1")).toEqual(
       expect.objectContaining({
-        codexThreadId: null,
-        activeTurnId: null,
+        agentSessionId: null,
+        activeRunId: null,
       }),
     );
     expect(messages.markdown.at(-1)).toContain("Ended");
   });
 
   it("queues new prompts while an idle session is ending", async () => {
-    const { service, codex, messages, store } = makeHarness();
+    const { service, agent, messages, store } = makeHarness();
     await store.upsertCurrentSession({
       userOpenId: "u1",
       projectKey: "bot",
-      codexThreadId: "thread-1",
-      activeTurnId: null,
+      agentSessionId: "old-session",
+      activeRunId: null,
       lastChatId: "chat-1",
       updatedAt: Date.now(),
     });
@@ -355,26 +424,31 @@ describe("BotService", () => {
     await service.handleEvent(message("start immediately"));
     await delay(10);
 
-    expect(codex.turnInputs).toHaveLength(0);
+    expect(agent.runInputs).toHaveLength(0);
 
     releaseDelete.resolve();
     await service.waitForIdle();
-    expect(codex.startedThreads).toHaveLength(1);
-    expect(codex.turnInputs.map((input) => input.text)).toEqual(["start immediately"]);
-    expect(await store.getCurrentSession("u1")).toEqual(expect.objectContaining({ codexThreadId: "thread-1" }));
+    expect(agent.createdSessions).toHaveLength(1);
+    expect(agent.runInputs.map((input) => input.text)).toEqual(["start immediately"]);
+    expect(await store.getCurrentSession("u1")).toEqual(expect.objectContaining({ agentSessionId: "session-1" }));
+    expect(messages.markdown.at(-1)).toBe("done");
   });
 });
 
-type FakeCodexEvents = CodexEvent[] | ((input: StartTurnInput) => AsyncIterable<CodexEvent>);
+type FakeAgentEvents = AgentRunEvent[] | ((input: StartAgentRunInput) => AsyncIterable<AgentRunEvent>);
 
-function makeHarness(events?: FakeCodexEvents, botOverrides: Partial<AppConfig["bot"]> = {}) {
+function makeHarness(
+  events?: FakeAgentEvents,
+  botOverrides: Partial<AppConfig["bot"]> = {},
+  capabilityOverrides: Partial<AgentCapabilities> = {},
+) {
   const config = testConfig(botOverrides);
   const gateway = new FakeGateway();
   const messages = new FakeMessages();
-  const codex = new FakeCodex(events);
+  const agent = new FakeAgent(events, capabilityOverrides);
   const store = new SqliteStateStore(join(mkdtempSync(join(tmpdir(), "feishu-code-bot-")), "state.sqlite"));
-  const service = new BotService(config, gateway, messages, codex, store);
-  return { service, gateway, messages, codex, store };
+  const service = new BotService(config, gateway, messages, agent, store);
+  return { service, gateway, messages, agent, store };
 }
 
 function testConfig(botOverrides: Partial<AppConfig["bot"]> = {}): AppConfig {
@@ -387,7 +461,8 @@ function testConfig(botOverrides: Partial<AppConfig["bot"]> = {}): AppConfig {
       allowedChats: [],
     },
     projects: [{ key: "bot", name: "Bot", path: process.cwd(), sandbox: "workspace-write" }],
-    codex: {
+    agent: {
+      type: "codex",
       binaryPath: "codex",
       defaultSandbox: "workspace-write",
       defaultApprovalPolicy: "on-request",
@@ -448,45 +523,58 @@ class FakeMessages implements FeishuMessagePort {
   }
 }
 
-class FakeCodex implements CodexDriver {
-  startedThreads: StartThreadInput[] = [];
-  turnInputs: StartTurnInput[] = [];
-  interruptedTurns: InterruptTurnInput[] = [];
-  resolvedApprovals: ResolveApprovalInput[] = [];
+class FakeAgent implements CodeAgentDriver {
+  readonly metadata = { id: "fake-agent", displayName: "Test Agent" };
+  readonly capabilities: AgentCapabilities = {
+    resumeSession: true,
+    interruptRun: true,
+    approvals: true,
+    planUpdates: true,
+    fileDiffs: true,
+  };
 
-  constructor(private readonly events?: FakeCodexEvents) {}
+  createdSessions: CreateAgentSessionInput[] = [];
+  resumedSessions: ResumeAgentSessionInput[] = [];
+  runInputs: StartAgentRunInput[] = [];
+  interruptedRuns: InterruptAgentRunInput[] = [];
+  resolvedApprovals: ResolveAgentApprovalInput[] = [];
+
+  constructor(private readonly events?: FakeAgentEvents, capabilityOverrides: Partial<AgentCapabilities> = {}) {
+    this.capabilities = { ...this.capabilities, ...capabilityOverrides };
+  }
 
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
 
-  async startThread(input: StartThreadInput): Promise<CodexThread> {
-    this.startedThreads.push(input);
-    return { id: "thread-1" };
+  async createSession(input: CreateAgentSessionInput): Promise<AgentSession> {
+    this.createdSessions.push(input);
+    return { id: `session-${this.createdSessions.length}`, resumeSupported: this.capabilities.resumeSession };
   }
 
-  async resumeThread(): Promise<CodexThread> {
-    return { id: "thread-1" };
+  async resumeSession(input: ResumeAgentSessionInput): Promise<AgentSession> {
+    this.resumedSessions.push(input);
+    return { id: input.sessionId, resumeSupported: this.capabilities.resumeSession };
   }
 
-  async *startTurn(input: StartTurnInput): AsyncIterable<CodexEvent> {
-    this.turnInputs.push(input);
-    const events: AsyncIterable<CodexEvent> | Iterable<CodexEvent> = this.events
+  async *startRun(input: StartAgentRunInput): AsyncIterable<AgentRunEvent> {
+    this.runInputs.push(input);
+    const events: AsyncIterable<AgentRunEvent> | Iterable<AgentRunEvent> = this.events
       ? typeof this.events === "function"
         ? this.events(input)
         : this.events
       : ([
-        { type: "turn_started", threadId: input.threadId, turnId: "turn-1" },
-        { type: "agent_delta", threadId: input.threadId, turnId: "turn-1", delta: "done" },
-        { type: "turn_completed", threadId: input.threadId, turnId: "turn-1", status: "completed" },
-      ] satisfies CodexEvent[]);
+        { type: "run_started", sessionId: input.sessionId, runId: "run-1" },
+        { type: "agent_delta", sessionId: input.sessionId, runId: "run-1", delta: "done" },
+        { type: "run_completed", sessionId: input.sessionId, runId: "run-1", status: "completed" },
+      ] satisfies AgentRunEvent[]);
     for await (const event of events) yield event;
   }
 
-  async interruptTurn(input: InterruptTurnInput): Promise<void> {
-    this.interruptedTurns.push(input);
+  async interruptRun(input: InterruptAgentRunInput): Promise<void> {
+    this.interruptedRuns.push(input);
   }
 
-  async resolveApproval(input: ResolveApprovalInput): Promise<void> {
+  async resolveApproval(input: ResolveAgentApprovalInput): Promise<void> {
     this.resolvedApprovals.push(input);
   }
 }
