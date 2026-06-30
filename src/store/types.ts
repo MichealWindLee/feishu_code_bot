@@ -1,10 +1,10 @@
-import type { ApprovalKind } from "../codex/types.js";
+import type { AgentApprovalKind } from "../agent/types.js";
 
 export interface CurrentSession {
   userOpenId: string;
   projectKey: string;
-  codexThreadId: string | null;
-  activeTurnId: string | null;
+  agentSessionId: string | null;
+  activeRunId: string | null;
   lastChatId: string | null;
   updatedAt: number;
 }
@@ -12,10 +12,10 @@ export interface CurrentSession {
 export interface PendingApproval {
   approvalShortId: string;
   userOpenId: string;
-  codexThreadId: string;
-  turnId: string;
+  agentSessionId: string;
+  runId: string;
   requestId: string;
-  approvalKind: ApprovalKind;
+  approvalKind: AgentApprovalKind;
   payloadJson: string;
   expiresAt: number;
 }
@@ -23,7 +23,7 @@ export interface PendingApproval {
 export interface StateStore {
   getCurrentSession(userOpenId: string): Promise<CurrentSession | null>;
   upsertCurrentSession(session: CurrentSession): Promise<void>;
-  clearActiveTurn(userOpenId: string, turnId?: string): Promise<void>;
+  clearActiveRun(userOpenId: string, runId?: string): Promise<void>;
   markInterruptedActiveSessions(): Promise<CurrentSession[]>;
   savePendingApproval(approval: PendingApproval): Promise<void>;
   getPendingApproval(approvalShortId: string): Promise<PendingApproval | null>;
