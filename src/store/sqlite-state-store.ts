@@ -6,8 +6,8 @@ import type { CurrentSession, PendingApproval, StateStore } from "./types.js";
 type SessionRow = {
   user_open_id: string;
   project_key: string;
-  codex_thread_id: string | null;
-  active_turn_id: string | null;
+  agent_session_id: string | null;
+  active_run_id: string | null;
   last_chat_id: string | null;
   updated_at: number;
 };
@@ -15,8 +15,8 @@ type SessionRow = {
 type ApprovalRow = {
   approval_short_id: string;
   user_open_id: string;
-  codex_thread_id: string;
-  turn_id: string;
+  agent_session_id: string;
+  run_id: string;
   request_id: string;
   approval_kind: string;
   payload_json: string;
@@ -50,12 +50,12 @@ export class SqliteStateStore implements StateStore {
       .prepare(
         `
         insert into current_sessions (
-          user_open_id, project_key, codex_thread_id, active_turn_id, last_chat_id, updated_at
+          user_open_id, project_key, agent_session_id, active_run_id, last_chat_id, updated_at
         ) values (?, ?, ?, ?, ?, ?)
         on conflict(user_open_id) do update set
           project_key = excluded.project_key,
-          codex_thread_id = excluded.codex_thread_id,
-          active_turn_id = excluded.active_turn_id,
+          agent_session_id = excluded.agent_session_id,
+          active_run_id = excluded.active_run_id,
           last_chat_id = excluded.last_chat_id,
           updated_at = excluded.updated_at
       `,
@@ -63,31 +63,31 @@ export class SqliteStateStore implements StateStore {
       .run(
         session.userOpenId,
         session.projectKey,
-        session.codexThreadId,
-        session.activeTurnId,
+        session.agentSessionId,
+        session.activeRunId,
         session.lastChatId,
         session.updatedAt,
       );
   }
 
-  async clearActiveTurn(userOpenId: string, turnId?: string): Promise<void> {
-    if (turnId) {
+  async clearActiveRun(userOpenId: string, runId?: string): Promise<void> {
+    if (runId) {
       this.db
         .prepare(
           `
           update current_sessions
-          set active_turn_id = null, updated_at = ?
-          where user_open_id = ? and active_turn_id = ?
+          set active_run_id = null, updated_at = ?
+          where user_open_id = ? and active_run_id = ?
         `,
         )
-        .run(Date.now(), userOpenId, turnId);
+        .run(Date.now(), userOpenId, runId);
       return;
     }
     this.db
       .prepare(
         `
         update current_sessions
-        set active_turn_id = null, updated_at = ?
+        set active_run_id = null, updated_at = ?
         where user_open_id = ?
       `,
       )
@@ -96,10 +96,10 @@ export class SqliteStateStore implements StateStore {
 
   async markInterruptedActiveSessions(): Promise<CurrentSession[]> {
     const rows = this.db
-      .prepare("select * from current_sessions where active_turn_id is not null")
+      .prepare("select * from current_sessions where active_run_id is not null")
       .all() as SessionRow[];
     this.db
-      .prepare("update current_sessions set active_turn_id = null, updated_at = ? where active_turn_id is not null")
+      .prepare("update current_sessions set active_run_id = null, updated_at = ? where active_run_id is not null")
       .run(Date.now());
     return rows.map(mapSession);
   }
@@ -109,7 +109,7 @@ export class SqliteStateStore implements StateStore {
       .prepare(
         `
         insert into pending_approvals (
-          approval_short_id, user_open_id, codex_thread_id, turn_id, request_id,
+          approval_short_id, user_open_id, agent_session_id, run_id, request_id,
           approval_kind, payload_json, expires_at
         ) values (?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(approval_short_id) do update set
@@ -120,8 +120,8 @@ export class SqliteStateStore implements StateStore {
       .run(
         approval.approvalShortId,
         approval.userOpenId,
-        approval.codexThreadId,
-        approval.turnId,
+        approval.agentSessionId,
+        approval.runId,
         approval.requestId,
         approval.approvalKind,
         approval.payloadJson,
@@ -166,12 +166,13 @@ export class SqliteStateStore implements StateStore {
   }
 
   private migrate(): void {
+    this.dropOldCodexStateIfNeeded();
     this.db.exec(`
       create table if not exists current_sessions (
         user_open_id text primary key,
         project_key text not null,
-        codex_thread_id text,
-        active_turn_id text,
+        agent_session_id text,
+        active_run_id text,
         last_chat_id text,
         updated_at integer not null
       );
@@ -179,8 +180,8 @@ export class SqliteStateStore implements StateStore {
       create table if not exists pending_approvals (
         approval_short_id text primary key,
         user_open_id text not null,
-        codex_thread_id text not null,
-        turn_id text not null,
+        agent_session_id text not null,
+        run_id text not null,
         request_id text not null,
         approval_kind text not null,
         payload_json text not null,
@@ -198,14 +199,25 @@ export class SqliteStateStore implements StateStore {
         on event_dedup (expires_at);
     `);
   }
+
+  private dropOldCodexStateIfNeeded(): void {
+    const sessionColumns = tableColumns(this.db, "current_sessions");
+    const approvalColumns = tableColumns(this.db, "pending_approvals");
+    if (sessionColumns.size > 0 && !sessionColumns.has("agent_session_id")) {
+      this.db.exec("drop table if exists current_sessions;");
+    }
+    if (approvalColumns.size > 0 && !approvalColumns.has("agent_session_id")) {
+      this.db.exec("drop table if exists pending_approvals;");
+    }
+  }
 }
 
 function mapSession(row: SessionRow): CurrentSession {
   return {
     userOpenId: row.user_open_id,
     projectKey: row.project_key,
-    codexThreadId: row.codex_thread_id,
-    activeTurnId: row.active_turn_id,
+    agentSessionId: row.agent_session_id,
+    activeRunId: row.active_run_id,
     lastChatId: row.last_chat_id,
     updatedAt: row.updated_at,
   };
@@ -215,11 +227,16 @@ function mapApproval(row: ApprovalRow): PendingApproval {
   return {
     approvalShortId: row.approval_short_id,
     userOpenId: row.user_open_id,
-    codexThreadId: row.codex_thread_id,
-    turnId: row.turn_id,
+    agentSessionId: row.agent_session_id,
+    runId: row.run_id,
     requestId: row.request_id,
     approvalKind: row.approval_kind as PendingApproval["approvalKind"],
     payloadJson: row.payload_json,
     expiresAt: row.expires_at,
   };
+}
+
+function tableColumns(db: Database.Database, tableName: string): Set<string> {
+  const rows = db.prepare(`pragma table_info(${tableName})`).all() as Array<{ name?: string }>;
+  return new Set(rows.map((row) => row.name).filter((name): name is string => typeof name === "string"));
 }

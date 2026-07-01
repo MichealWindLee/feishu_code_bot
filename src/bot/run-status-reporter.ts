@@ -1,17 +1,17 @@
-import type { CodexAgentMessagePhase, CodexItemSummary, CodexPlanStep } from "../codex/types.js";
+import type { AgentCapabilities, AgentItemSummary, AgentMessagePhase, AgentPlanStep } from "../agent/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
 
-type CardStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "interrupted";
+type RunCardStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "interrupted";
 
 const PROGRESS_UPDATE_INTERVAL_MS = 20_000;
 const MIN_PROGRESS_DELTA_LENGTH = 40;
 
-export class TurnStatusReporter {
+export class RunStatusReporter {
   private messageId: string | null = null;
-  private status: CardStatus = "queued";
-  private current = "等待 Codex 开始处理";
-  private lastTurnStatus = "inProgress";
-  private readonly plan: CodexPlanStep[] = [];
+  private status: RunCardStatus = "queued";
+  private current: string;
+  private lastRunStatus = "inProgress";
+  private readonly plan: AgentPlanStep[] = [];
   private readonly changedFiles = new Set<string>();
   private progressText = "";
   private progressDraft = "";
@@ -27,19 +27,23 @@ export class TurnStatusReporter {
     private readonly messages: FeishuMessagePort,
     private readonly target: ReplyTarget,
     private readonly projectKey: string,
-  ) {}
+    private readonly agentDisplayName: string,
+    private readonly capabilities: AgentCapabilities,
+  ) {
+    this.current = `等待 ${this.agentDisplayName} 开始处理`;
+  }
 
   async start(): Promise<void> {
     await this.createOrUpdateCard();
   }
 
-  async turnStarted(): Promise<void> {
+  async runStarted(): Promise<void> {
     this.status = "running";
-    this.current = "Codex 正在处理";
+    this.current = `${this.agentDisplayName} 正在处理`;
     await this.createOrUpdateCard();
   }
 
-  async agentDelta(delta: string, messagePhase?: CodexAgentMessagePhase | null, itemId?: string): Promise<void> {
+  async agentDelta(delta: string, messagePhase?: AgentMessagePhase | null, itemId?: string): Promise<void> {
     if (messagePhase === "commentary") {
       if (itemId && this.progressItemId !== itemId) {
         this.progressItemId = itemId;
@@ -52,12 +56,13 @@ export class TurnStatusReporter {
     this.agentText += delta;
   }
 
-  async planUpdated(_explanation: string | null | undefined, steps: CodexPlanStep[]): Promise<void> {
+  async planUpdated(_explanation: string | null | undefined, steps: AgentPlanStep[]): Promise<void> {
+    if (!this.capabilities.planUpdates) return;
     this.plan.splice(0, this.plan.length, ...steps);
     await this.createOrUpdateCard();
   }
 
-  recordItemStarted(item: CodexItemSummary): void {
+  recordItemStarted(item: AgentItemSummary): void {
     if (item.type === "agent_message" && item.messagePhase === "commentary") {
       if (this.progressItemId !== item.id) {
         this.progressItemId = item.id;
@@ -68,7 +73,7 @@ export class TurnStatusReporter {
     }
   }
 
-  async itemCompleted(item: CodexItemSummary): Promise<void> {
+  async itemCompleted(item: AgentItemSummary): Promise<void> {
     if (item.type === "agent_message" && item.text) {
       if (item.messagePhase === "commentary") {
         this.progressItemId = item.id;
@@ -80,10 +85,13 @@ export class TurnStatusReporter {
     }
     if (item.type === "command_execution") this.commandCount += 1;
     if (item.type === "mcp_tool_call" || item.type === "dynamic_tool_call") this.toolCount += 1;
-    for (const file of item.changedFiles ?? []) this.changedFiles.add(file);
+    if (this.capabilities.fileDiffs) {
+      for (const file of item.changedFiles ?? []) this.changedFiles.add(file);
+    }
   }
 
   async diffUpdated(changedFiles: string[]): Promise<void> {
+    if (!this.capabilities.fileDiffs) return;
     const before = this.changedFiles.size;
     for (const file of changedFiles) {
       this.changedFiles.add(file);
@@ -104,19 +112,19 @@ export class TurnStatusReporter {
 
   async warning(): Promise<void> {
     this.warningCount += 1;
-    this.current = "Codex 返回提示";
+    this.current = `${this.agentDisplayName} 返回提示`;
     await this.createOrUpdateCard();
   }
 
   async completed(status: string): Promise<void> {
-    this.lastTurnStatus = status;
+    this.lastRunStatus = status;
     this.status = statusToCardStatus(status);
     this.current = statusToCurrentText(status);
     await this.createOrUpdateCard();
   }
 
   async fail(message: string): Promise<void> {
-    this.lastTurnStatus = "failed";
+    this.lastRunStatus = "failed";
     this.status = "failed";
     this.current = message;
     await this.createOrUpdateCard();
@@ -126,12 +134,13 @@ export class TurnStatusReporter {
     return this.agentText.trim();
   }
 
-  turnStatus(): string {
-    return this.lastTurnStatus;
+  runStatus(): string {
+    return this.lastRunStatus;
   }
 
   private async createOrUpdateCard(): Promise<void> {
-    const card = renderTurnStatusCard({
+    const card = renderRunStatusCard({
+      agentDisplayName: this.agentDisplayName,
       projectKey: this.projectKey,
       status: this.status,
       current: this.current,
@@ -152,7 +161,7 @@ export class TurnStatusReporter {
         this.messageId = result.messageId;
       }
     } catch (error) {
-      console.error("Failed to update Codex status card", error);
+      console.error("Failed to update agent status card", error);
     }
   }
 
@@ -174,18 +183,19 @@ export class TurnStatusReporter {
 
     this.progressText = progress;
     if (this.status === "queued") this.status = "running";
-    if (this.current === "等待 Codex 开始处理") this.current = "Codex 正在处理";
+    if (this.current === `等待 ${this.agentDisplayName} 开始处理`) this.current = `${this.agentDisplayName} 正在处理`;
     this.lastProgressCardAt = now;
     await this.createOrUpdateCard();
   }
 }
 
-type TurnCardState = {
+type RunCardState = {
+  agentDisplayName: string;
   projectKey: string;
-  status: CardStatus;
+  status: RunCardStatus;
   current: string;
   progressText: string;
-  plan: CodexPlanStep[];
+  plan: AgentPlanStep[];
   changedFiles: string[];
   commandCount: number;
   toolCount: number;
@@ -193,7 +203,7 @@ type TurnCardState = {
   warningCount: number;
 };
 
-function renderTurnStatusCard(state: TurnCardState): object {
+function renderRunStatusCard(state: RunCardState): object {
   const summary = [
     `**状态**：${statusLabel(state.status)}`,
     `**项目**：${state.projectKey}`,
@@ -249,13 +259,13 @@ function renderTurnStatusCard(state: TurnCardState): object {
     config: { wide_screen_mode: true },
     header: {
       template: statusTemplate(state.status),
-      title: { tag: "plain_text", content: `Codex ${statusLabel(state.status)}` },
+      title: { tag: "plain_text", content: `${state.agentDisplayName} ${statusLabel(state.status)}` },
     },
     elements,
   };
 }
 
-function statusToCardStatus(status: string): CardStatus {
+function statusToCardStatus(status: string): RunCardStatus {
   if (status === "completed") return "completed";
   if (status === "interrupted") return "interrupted";
   if (status === "failed") return "failed";
@@ -263,13 +273,13 @@ function statusToCardStatus(status: string): CardStatus {
 }
 
 function statusToCurrentText(status: string): string {
-  if (status === "completed") return "Codex 任务已完成";
-  if (status === "interrupted") return "Codex 任务已中止";
-  if (status === "failed") return "Codex 任务失败";
-  return "Codex 仍在处理";
+  if (status === "completed") return "任务已完成";
+  if (status === "interrupted") return "任务已中止";
+  if (status === "failed") return "任务失败";
+  return "仍在处理";
 }
 
-function statusLabel(status: CardStatus): string {
+function statusLabel(status: RunCardStatus): string {
   switch (status) {
     case "queued":
       return "已接收";
@@ -286,7 +296,7 @@ function statusLabel(status: CardStatus): string {
   }
 }
 
-function statusTemplate(status: CardStatus): string {
+function statusTemplate(status: RunCardStatus): string {
   switch (status) {
     case "completed":
       return "green";
@@ -302,7 +312,7 @@ function statusTemplate(status: CardStatus): string {
   }
 }
 
-function planMarker(status: CodexPlanStep["status"]): string {
+function planMarker(status: AgentPlanStep["status"]): string {
   if (status === "completed") return "[x]";
   if (status === "inProgress") return "[-]";
   return "[ ]";

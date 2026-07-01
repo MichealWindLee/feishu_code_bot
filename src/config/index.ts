@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
-import type { AppConfig, ApprovalPolicy, LoadConfigOptions, SandboxMode } from "./types.js";
+import { AGENT_TYPES, type AgentConfig, type AppConfig, type ApprovalPolicy, type LoadConfigOptions, type SandboxMode } from "./types.js";
 
 let defaultDotenvLoaded = false;
 
@@ -14,7 +14,8 @@ const defaultConfig: AppConfig = {
     allowedChats: [],
   },
   projects: [],
-  codex: {
+  agent: {
+    type: "codex",
     binaryPath: "codex",
     defaultSandbox: "workspace-write",
     defaultApprovalPolicy: "on-request",
@@ -78,7 +79,7 @@ export function loadConfig(options: LoadConfigOptions | string = {}): AppConfig 
   if (process.env.FEISHU_APP_ID) merged.feishu.appId = process.env.FEISHU_APP_ID;
   if (process.env.FEISHU_APP_SECRET) merged.feishu.appSecret = process.env.FEISHU_APP_SECRET;
   if (process.env.FEISHU_BOT_OPEN_ID) merged.feishu.botOpenId = process.env.FEISHU_BOT_OPEN_ID;
-  if (process.env.CODEX_BINARY_PATH) merged.codex.binaryPath = process.env.CODEX_BINARY_PATH;
+  if (process.env.CODEX_BINARY_PATH && merged.agent.type === "codex") merged.agent.binaryPath = process.env.CODEX_BINARY_PATH;
   if (process.env.SQLITE_PATH) merged.storage.sqlitePath = process.env.SQLITE_PATH;
   if (loadOptions.debugPromptAcceptedFeedback !== undefined) {
     merged.bot.debugPromptAcceptedFeedback = loadOptions.debugPromptAcceptedFeedback;
@@ -143,8 +144,7 @@ function validateConfig(config: AppConfig): void {
     if (project.sandbox) assertSandbox(project.sandbox);
     if (project.approvalPolicy) assertApprovalPolicy(project.approvalPolicy);
   }
-  assertSandbox(config.codex.defaultSandbox);
-  assertApprovalPolicy(config.codex.defaultApprovalPolicy);
+  validateAgent(config.agent);
 }
 
 function assertSandbox(value: SandboxMode): void {
@@ -162,4 +162,18 @@ function assertApprovalPolicy(value: ApprovalPolicy): void {
 export function getProject(config: AppConfig, key: string | undefined) {
   if (!key) return config.projects[0];
   return config.projects.find((project) => project.key === key) ?? null;
+}
+
+function validateAgent(agent: AgentConfig): void {
+  if (!isAgentType(agent.type)) throw new Error(`Unsupported agent type: ${(agent as { type?: string }).type}`);
+  if (agent.displayName !== undefined && (typeof agent.displayName !== "string" || agent.displayName.trim().length === 0)) {
+    throw new Error("Invalid agent.displayName");
+  }
+  if (!agent.binaryPath) throw new Error("Missing agent.binaryPath");
+  assertSandbox(agent.defaultSandbox);
+  assertApprovalPolicy(agent.defaultApprovalPolicy);
+}
+
+function isAgentType(value: unknown): boolean {
+  return typeof value === "string" && (AGENT_TYPES as readonly string[]).includes(value);
 }

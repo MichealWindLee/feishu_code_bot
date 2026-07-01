@@ -1,7 +1,7 @@
 import { commandHelp, parseCommand, type BotCommand } from "./commands.js";
 import { getProject } from "../config/index.js";
+import type { CodeAgentDriver } from "../agent/types.js";
 import type { AppConfig } from "../config/types.js";
-import type { CodexDriver } from "../codex/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
 import type { SessionManager, SessionStatus } from "../session/session-manager.js";
 import type { StateStore } from "../store/types.js";
@@ -9,7 +9,7 @@ import type { StateStore } from "../store/types.js";
 type BotCommandHandlerDeps = {
   config: AppConfig;
   messages: FeishuMessagePort;
-  codex: CodexDriver;
+  agent: CodeAgentDriver;
   store: StateStore;
   sessions: SessionManager;
 };
@@ -20,7 +20,7 @@ export class BotCommandHandler {
   async handle(command: BotCommand, userOpenId: string, target: ReplyTarget): Promise<void> {
     switch (command.type) {
       case "help":
-        await this.deps.messages.sendMarkdown(target, commandHelp());
+        await this.deps.messages.sendMarkdown(target, commandHelp(this.deps.agent.metadata.displayName));
         return;
       case "projects":
         await this.deps.messages.sendMarkdown(target, this.formatProjects());
@@ -70,46 +70,51 @@ export class BotCommandHandler {
   private async handleNewSession(userOpenId: string, target: ReplyTarget): Promise<void> {
     const result = await this.deps.sessions.startNewSession(userOpenId, target.chatId);
     if (result.status === "missing_project") throw new Error(`Configured project missing: ${result.projectKey}`);
-    await this.deps.messages.sendMarkdown(target, `Started a new Codex session for ${result.projectKey}.`);
+    await this.deps.messages.sendMarkdown(target, `Started a new ${this.deps.agent.metadata.displayName} session for ${result.projectKey}.`);
   }
 
   private async handleEndSession(userOpenId: string, target: ReplyTarget): Promise<void> {
     const result = await this.deps.sessions.endSession(userOpenId, target.chatId);
     if (result.status === "none") {
-      await this.deps.messages.sendMarkdown(target, "No Codex session to end.");
+      await this.deps.messages.sendMarkdown(target, `No ${this.deps.agent.metadata.displayName} session to end.`);
       return;
     }
-    await this.deps.messages.sendMarkdown(target, "Ended the current Codex session. Send a prompt to start a new one.");
+    await this.deps.messages.sendMarkdown(target, `Ended the current ${this.deps.agent.metadata.displayName} session. Send a prompt to start a new one.`);
   }
 
   private async handleStatus(userOpenId: string, target: ReplyTarget): Promise<void> {
     const snapshot = await this.deps.sessions.getSnapshot(userOpenId);
     const session = snapshot.session;
     if (!session) {
-      await this.deps.messages.sendMarkdown(target, "No Codex session yet. Send a prompt or use /projects.");
+      await this.deps.messages.sendMarkdown(target, `No ${this.deps.agent.metadata.displayName} session yet. Send a prompt or use /projects.`);
       return;
     }
     await this.deps.messages.sendMarkdown(
       target,
       [
+        `Agent: ${this.deps.agent.metadata.displayName}`,
         `Project: ${session.projectKey}`,
-        `Thread: ${session.codexThreadId ?? "(not started)"}`,
-        `Active turn: ${session.activeTurnId ?? (snapshot.status === "idle" ? "(none)" : `(${statusLabel(snapshot.status)})`)}`,
+        `Session: ${session.agentSessionId ?? "(not started)"}`,
+        `Active run: ${session.activeRunId ?? (snapshot.status === "idle" ? "(none)" : `(${statusLabel(snapshot.status)})`)}`,
       ].join("\n"),
     );
   }
 
   private async handleStop(userOpenId: string, target: ReplyTarget): Promise<void> {
-    const result = await this.deps.sessions.stopTurn(userOpenId);
+    const result = await this.deps.sessions.stopRun(userOpenId);
     if (result.status === "starting") {
-      await this.deps.messages.sendMarkdown(target, "Stop requested. The Codex task is still starting.");
+      await this.deps.messages.sendMarkdown(target, `Stop requested. The ${this.deps.agent.metadata.displayName} task is still starting.`);
+      return;
+    }
+    if (result.status === "unsupported") {
+      await this.deps.messages.sendMarkdown(target, `${this.deps.agent.metadata.displayName} does not support remote task interruption.`);
       return;
     }
     if (result.status === "none") {
-      await this.deps.messages.sendMarkdown(target, "No active Codex task.");
+      await this.deps.messages.sendMarkdown(target, `No active ${this.deps.agent.metadata.displayName} task.`);
       return;
     }
-    await this.deps.messages.sendMarkdown(target, "Stopped the active Codex task.");
+    await this.deps.messages.sendMarkdown(target, `Stopped the active ${this.deps.agent.metadata.displayName} task.`);
   }
 
   private async handlePermissions(userOpenId: string, target: ReplyTarget): Promise<void> {
@@ -118,8 +123,11 @@ export class BotCommandHandler {
     await this.deps.messages.sendMarkdown(
       target,
       [
-        `Sandbox: ${project?.sandbox ?? this.deps.config.codex.defaultSandbox}`,
-        `Approval policy: ${project?.approvalPolicy ?? this.deps.config.codex.defaultApprovalPolicy}`,
+        `Agent: ${this.deps.agent.metadata.displayName}`,
+        `Sandbox: ${project?.sandbox ?? this.deps.config.agent.defaultSandbox}`,
+        `Approval policy: ${project?.approvalPolicy ?? this.deps.config.agent.defaultApprovalPolicy}`,
+        `Approvals: ${this.deps.agent.capabilities.approvals ? "supported" : "unsupported"}`,
+        `Interrupt: ${this.deps.agent.capabilities.interruptRun ? "supported" : "unsupported"}`,
       ].join("\n"),
     );
   }
@@ -141,12 +149,16 @@ export class BotCommandHandler {
       return;
     }
     if (pending.userOpenId !== userOpenId) {
-      await this.deps.messages.sendMarkdown(target, "Only the user who triggered the Codex request can resolve it.");
+      await this.deps.messages.sendMarkdown(target, `Only the user who triggered the ${this.deps.agent.metadata.displayName} request can resolve it.`);
+      return;
+    }
+    if (!this.deps.agent.capabilities.approvals || !this.deps.agent.resolveApproval) {
+      await this.deps.messages.sendMarkdown(target, `${this.deps.agent.metadata.displayName} does not support remote approval resolution.`);
       return;
     }
 
     const raw = JSON.parse(pending.payloadJson) as { requestId?: string | number };
-    await this.deps.codex.resolveApproval({
+    await this.deps.agent.resolveApproval({
       kind: pending.approvalKind,
       requestId: raw.requestId ?? pending.requestId,
       approved,
@@ -176,11 +188,11 @@ export function commandFromActionValue(value: unknown): BotCommand | null {
 
 function statusLabel(status: SessionStatus): string {
   switch (status) {
-    case "starting_turn":
+    case "starting_run":
       return "starting";
-    case "running_turn":
+    case "running_run":
       return "running";
-    case "stopping_turn":
+    case "stopping_run":
       return "stopping";
     case "ending_session":
       return "ending";

@@ -12,17 +12,17 @@ import {
   summarizeItem,
 } from "./app-server-events.js";
 import type {
-  CodexAgentMessagePhase,
-  CodexDriver,
-  CodexEvent,
-  CodexItemSummary,
-  CodexThread,
-  InterruptTurnInput,
-  ResolveApprovalInput,
-  ResumeThreadInput,
-  StartThreadInput,
-  StartTurnInput,
-} from "./types.js";
+  AgentItemSummary,
+  AgentMessagePhase,
+  AgentMetadata,
+  AgentRunEvent,
+  AgentSession,
+  CodeAgentDriver,
+  InterruptAgentRunInput,
+  ResolveAgentApprovalInput,
+  ResumeAgentSessionInput,
+  StartAgentRunInput,
+} from "../agent/types.js";
 
 type JsonRpcId = string | number;
 
@@ -39,21 +39,36 @@ type RpcMessage = {
   error?: { code?: number; message?: string };
 };
 
-export class CodexAppServerDriver implements CodexDriver {
+export class CodexAppServerDriver implements CodeAgentDriver {
+  readonly metadata: AgentMetadata;
+
+  readonly capabilities = {
+    resumeSession: true,
+    interruptRun: true,
+    approvals: true,
+    planUpdates: true,
+    fileDiffs: true,
+  };
+
   private proc: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
   private readonly pending = new Map<string, PendingRequest>();
-  private readonly turnQueues = new Map<string, AsyncQueue<CodexEvent>>();
+  private readonly turnQueues = new Map<string, AsyncQueue<AgentRunEvent>>();
   private readonly turnThreadIds = new Map<string, string>();
-  private readonly bufferedTurnEvents = new Map<string, CodexEvent[]>();
-  private readonly agentMessagePhases = new Map<string, CodexAgentMessagePhase | null>();
+  private readonly bufferedTurnEvents = new Map<string, AgentRunEvent[]>();
+  private readonly agentMessagePhases = new Map<string, AgentMessagePhase | null>();
   private initialized = false;
 
-  constructor(private readonly config: AppConfig) {}
+  constructor(private readonly config: AppConfig) {
+    this.metadata = {
+      id: "codex",
+      displayName: config.agent.displayName ?? "Codex",
+    };
+  }
 
   async start(): Promise<void> {
     if (this.proc) return;
-    this.proc = spawn(this.config.codex.binaryPath, ["app-server", "--listen", "stdio://"], {
+    this.proc = spawn(this.config.agent.binaryPath, ["app-server", "--listen", "stdio://"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -81,7 +96,7 @@ export class CodexAppServerDriver implements CodexDriver {
     await this.request("initialize", {
       clientInfo: {
         name: "feishu_code_bot",
-        title: "Feishu Codex Bot",
+        title: `Feishu ${this.metadata.displayName} Bot`,
         version: "0.1.0",
       },
     });
@@ -96,43 +111,43 @@ export class CodexAppServerDriver implements CodexDriver {
     this.initialized = false;
   }
 
-  async startThread(input: StartThreadInput): Promise<CodexThread> {
+  async createSession(input: { project: ProjectConfig }): Promise<AgentSession> {
     await this.ensureStarted();
     const result = (await this.request("thread/start", threadParams(input.project, this.config))) as {
       thread?: { id?: string };
     };
     if (!result.thread?.id) throw new Error(`thread/start response missing thread id: ${JSON.stringify(result)}`);
-    return { id: result.thread.id };
+    return { id: result.thread.id, resumeSupported: true };
   }
 
-  async resumeThread(threadId: string, input: ResumeThreadInput): Promise<CodexThread> {
+  async resumeSession(input: ResumeAgentSessionInput): Promise<AgentSession> {
     await this.ensureStarted();
     const result = (await this.request("thread/resume", {
-      threadId,
+      threadId: input.sessionId,
       ...threadParams(input.project, this.config),
     })) as { thread?: { id?: string } };
     if (!result.thread?.id) throw new Error(`thread/resume response missing thread id: ${JSON.stringify(result)}`);
-    return { id: result.thread.id };
+    return { id: result.thread.id, resumeSupported: true };
   }
 
-  async *startTurn(input: StartTurnInput): AsyncIterable<CodexEvent> {
+  async *startRun(input: StartAgentRunInput): AsyncIterable<AgentRunEvent> {
     await this.ensureStarted();
     const result = (await this.request("turn/start", {
-      threadId: input.threadId,
+      threadId: input.sessionId,
       clientUserMessageId: input.clientUserMessageId,
       input: [{ type: "text", text: input.text, text_elements: [] }],
       cwd: input.project.path,
-      approvalPolicy: input.project.approvalPolicy ?? this.config.codex.defaultApprovalPolicy,
-      model: input.project.model ?? this.config.codex.model,
+      approvalPolicy: input.project.approvalPolicy ?? this.config.agent.defaultApprovalPolicy,
+      model: input.project.model ?? this.config.agent.model,
     })) as { turn?: { id?: string; status?: string } };
 
     const turnId = result.turn?.id;
     if (!turnId) throw new Error(`turn/start response missing turn id: ${JSON.stringify(result)}`);
 
-    const queue = new AsyncQueue<CodexEvent>();
+    const queue = new AsyncQueue<AgentRunEvent>();
     this.turnQueues.set(turnId, queue);
-    this.turnThreadIds.set(turnId, input.threadId);
-    queue.push({ type: "turn_started", threadId: input.threadId, turnId });
+    this.turnThreadIds.set(turnId, input.sessionId);
+    queue.push({ type: "run_started", sessionId: input.sessionId, runId: turnId });
     this.flushBufferedTurnEvents(turnId, queue);
 
     try {
@@ -145,15 +160,15 @@ export class CodexAppServerDriver implements CodexDriver {
     }
   }
 
-  async interruptTurn(input: InterruptTurnInput): Promise<void> {
+  async interruptRun(input: InterruptAgentRunInput): Promise<void> {
     await this.ensureStarted();
     await this.request("turn/interrupt", {
-      threadId: input.threadId,
-      turnId: input.turnId,
+      threadId: input.sessionId,
+      turnId: input.runId,
     });
   }
 
-  async resolveApproval(input: ResolveApprovalInput): Promise<void> {
+  async resolveApproval(input: ResolveAgentApprovalInput): Promise<void> {
     await this.ensureStarted();
     const raw = input.raw as { method?: string; requestId?: JsonRpcId; params?: unknown };
     if (raw.requestId === undefined) throw new Error("Approval payload missing requestId");
@@ -217,9 +232,9 @@ export class CodexAppServerDriver implements CodexDriver {
       case "turn/started": {
         if (turnId) {
           this.pushTurnEvent(turnId, {
-            type: "turn_started",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            type: "run_started",
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
           });
         }
         break;
@@ -229,8 +244,8 @@ export class CodexAppServerDriver implements CodexDriver {
           const itemId = typeof params?.itemId === "string" ? params.itemId : undefined;
           this.pushTurnEvent(turnId, {
             type: "agent_delta",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             itemId,
             messagePhase: itemId ? this.agentMessagePhases.get(itemId) : undefined,
             delta: String(params?.delta ?? ""),
@@ -242,8 +257,8 @@ export class CodexAppServerDriver implements CodexDriver {
         if (turnId) {
           this.pushTurnEvent(turnId, {
             type: "plan_updated",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             explanation: typeof params?.explanation === "string" ? params.explanation : null,
             steps: readPlanSteps(params),
           });
@@ -256,8 +271,8 @@ export class CodexAppServerDriver implements CodexDriver {
           this.rememberAgentMessagePhase(item);
           this.pushTurnEvent(turnId, {
             type: "item_started",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             item,
           });
         }
@@ -268,8 +283,8 @@ export class CodexAppServerDriver implements CodexDriver {
           const item = summarizeItem((params as { item?: unknown } | undefined)?.item);
           this.pushTurnEvent(turnId, {
             type: "item_completed",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             item,
           });
           if (item.type === "agent_message") this.agentMessagePhases.delete(item.id);
@@ -281,8 +296,8 @@ export class CodexAppServerDriver implements CodexDriver {
           const diff = typeof params?.diff === "string" ? params.diff : "";
           this.pushTurnEvent(turnId, {
             type: "diff_updated",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             diff,
             changedFiles: extractChangedFilesFromDiff(diff),
           });
@@ -297,9 +312,9 @@ export class CodexAppServerDriver implements CodexDriver {
         if (turnId) {
           const status = readTurnStatus(params);
           this.pushTurnEvent(turnId, {
-            type: "turn_completed",
-            threadId: String(params?.threadId ?? ""),
-            turnId,
+            type: "run_completed",
+            sessionId: String(params?.threadId ?? ""),
+            runId: turnId,
             status,
           });
         }
@@ -309,7 +324,7 @@ export class CodexAppServerDriver implements CodexDriver {
         const error = new Error(readErrorMessage(params));
         const queue = turnId ? this.turnQueues.get(turnId) : undefined;
         if (queue) queue.throw(error);
-        else if (turnId) this.pushTurnEvent(turnId, { type: "error", turnId, message: error.message });
+        else if (turnId) this.pushTurnEvent(turnId, { type: "error", runId: turnId, message: error.message });
         else this.failAll(error);
         break;
       }
@@ -326,7 +341,7 @@ export class CodexAppServerDriver implements CodexDriver {
       return;
     }
     for (const [turnId, queue] of this.turnQueues.entries()) {
-      if (this.turnThreadIds.get(turnId) === threadId) queue.push({ type: "warning", threadId, message });
+      if (this.turnThreadIds.get(turnId) === threadId) queue.push({ type: "warning", sessionId: threadId, message });
     }
   }
 
@@ -341,17 +356,17 @@ export class CodexAppServerDriver implements CodexDriver {
       return;
     }
 
-    if (!approval.turnId) {
+    if (!approval.runId) {
       this.send({
         id: message.id,
         result: approvalResult(approval.kind, false, (message.params as Record<string, unknown>) ?? {}),
       });
       return;
     }
-    this.pushTurnEvent(approval.turnId, { type: "approval_requested", approval });
+    this.pushTurnEvent(approval.runId, { type: "approval_requested", approval });
   }
 
-  private pushTurnEvent(turnId: string, event: CodexEvent): void {
+  private pushTurnEvent(turnId: string, event: AgentRunEvent): void {
     const queue = this.turnQueues.get(turnId);
     if (!queue) {
       const buffered = this.bufferedTurnEvents.get(turnId) ?? [];
@@ -360,16 +375,16 @@ export class CodexAppServerDriver implements CodexDriver {
       return;
     }
     queue.push(event);
-    if (event.type === "turn_completed") queue.close();
+    if (event.type === "run_completed") queue.close();
   }
 
-  private flushBufferedTurnEvents(turnId: string, queue: AsyncQueue<CodexEvent>): void {
+  private flushBufferedTurnEvents(turnId: string, queue: AsyncQueue<AgentRunEvent>): void {
     const buffered = this.bufferedTurnEvents.get(turnId);
     if (!buffered) return;
     this.bufferedTurnEvents.delete(turnId);
     for (const event of buffered) {
       queue.push(event);
-      if (event.type === "turn_completed") queue.close();
+      if (event.type === "run_completed") queue.close();
     }
   }
 
@@ -383,7 +398,7 @@ export class CodexAppServerDriver implements CodexDriver {
     this.agentMessagePhases.clear();
   }
 
-  private rememberAgentMessagePhase(item: CodexItemSummary): void {
+  private rememberAgentMessagePhase(item: AgentItemSummary): void {
     if (item.type === "agent_message") this.agentMessagePhases.set(item.id, item.messagePhase ?? null);
   }
 }
@@ -391,9 +406,9 @@ export class CodexAppServerDriver implements CodexDriver {
 function threadParams(project: ProjectConfig, config: AppConfig): Record<string, unknown> {
   return {
     cwd: project.path,
-    approvalPolicy: project.approvalPolicy ?? config.codex.defaultApprovalPolicy,
-    sandbox: project.sandbox ?? config.codex.defaultSandbox,
-    model: project.model ?? config.codex.model,
+    approvalPolicy: project.approvalPolicy ?? config.agent.defaultApprovalPolicy,
+    sandbox: project.sandbox ?? config.agent.defaultSandbox,
+    model: project.model ?? config.agent.model,
     serviceName: "feishu-code-bot",
   };
 }

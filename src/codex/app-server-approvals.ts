@@ -1,4 +1,4 @@
-import type { CodexApprovalRequest } from "./types.js";
+import type { AgentApprovalRequest } from "../agent/types.js";
 
 type JsonRpcId = string | number;
 
@@ -8,11 +8,11 @@ export type ApprovalRpcMessage = {
   params?: unknown;
 };
 
-export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalRequest | null {
+export function toApprovalRequest(message: ApprovalRpcMessage): AgentApprovalRequest | null {
   const params = message.params as Record<string, unknown> | undefined;
   if (!params) return null;
-  const threadId = String(params.threadId ?? "");
-  const turnId = String(params.turnId ?? "");
+  const sessionId = String(params.threadId ?? "");
+  const runId = String(params.turnId ?? "");
   const itemId = typeof params.itemId === "string" ? params.itemId : undefined;
   const raw = { method: message.method, requestId: message.id, params };
 
@@ -22,8 +22,8 @@ export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalReq
     return {
       kind: "command",
       requestId: message.id as JsonRpcId,
-      threadId,
-      turnId,
+      sessionId,
+      runId,
       itemId,
       title: "Codex wants to run a command",
       body: [`Command: ${command}`, cwd ? `CWD: ${cwd}` : null, params.reason ? `Reason: ${params.reason}` : null]
@@ -37,8 +37,8 @@ export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalReq
     return {
       kind: "file_change",
       requestId: message.id as JsonRpcId,
-      threadId,
-      turnId,
+      sessionId,
+      runId,
       itemId,
       title: "Codex wants extra file write access",
       body: String(params.reason ?? params.grantRoot ?? "File change approval requested."),
@@ -50,8 +50,8 @@ export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalReq
     return {
       kind: "permissions",
       requestId: message.id as JsonRpcId,
-      threadId,
-      turnId,
+      sessionId,
+      runId,
       itemId,
       title: "Codex requests additional permissions",
       body: [
@@ -68,8 +68,8 @@ export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalReq
     return {
       kind: "legacy_exec",
       requestId: message.id as JsonRpcId,
-      threadId: String(params.conversationId ?? ""),
-      turnId: String(params.callId ?? ""),
+      sessionId: String(params.conversationId ?? ""),
+      runId: String(params.callId ?? ""),
       itemId: typeof params.approvalId === "string" ? params.approvalId : undefined,
       title: "Codex wants to run a command",
       body: [`Command: ${command}`, cwd ? `CWD: ${cwd}` : null, params.reason ? `Reason: ${params.reason}` : null]
@@ -83,8 +83,8 @@ export function toApprovalRequest(message: ApprovalRpcMessage): CodexApprovalReq
     return {
       kind: "legacy_apply_patch",
       requestId: message.id as JsonRpcId,
-      threadId: String(params.conversationId ?? ""),
-      turnId: String(params.callId ?? ""),
+      sessionId: String(params.conversationId ?? ""),
+      runId: String(params.callId ?? ""),
       title: "Codex wants to apply a patch",
       body: [
         params.reason ? `Reason: ${params.reason}` : "Patch approval requested.",

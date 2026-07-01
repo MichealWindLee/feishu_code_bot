@@ -1,8 +1,8 @@
 import { BotCommandHandler, commandFromActionValue } from "./command-handler.js";
 import { parseCommand } from "./commands.js";
-import { TurnStatusReporter } from "./turn-status-reporter.js";
+import { RunStatusReporter } from "./run-status-reporter.js";
+import type { AgentRunEvent, CodeAgentDriver } from "../agent/types.js";
 import type { AppConfig } from "../config/types.js";
-import type { CodexDriver, CodexEvent } from "../codex/types.js";
 import type {
   FeishuBotMenuEvent,
   FeishuCardActionEvent,
@@ -26,14 +26,14 @@ export class BotService {
     private readonly config: AppConfig,
     private readonly gateway: FeishuGateway,
     private readonly messages: FeishuMessagePort,
-    private readonly codex: CodexDriver,
+    private readonly agent: CodeAgentDriver,
     private readonly store: StateStore,
   ) {
-    this.sessions = new SessionManager(this.config, this.store, this.codex);
+    this.sessions = new SessionManager(this.config, this.store, this.agent);
     this.commands = new BotCommandHandler({
       config: this.config,
       messages: this.messages,
-      codex: this.codex,
+      agent: this.agent,
       store: this.store,
       sessions: this.sessions,
     });
@@ -42,7 +42,7 @@ export class BotService {
   async start(): Promise<void> {
     await this.store.cleanupExpired(Date.now());
     await this.store.markInterruptedActiveSessions();
-    await this.codex.start();
+    await this.agent.start();
     this.gateway.onEvent((event) => {
       void this.handleEvent(event).catch((error) => {
         console.error("Failed to handle Feishu event", error);
@@ -60,7 +60,7 @@ export class BotService {
     this.stopping = true;
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
     await this.gateway.stop();
-    await this.codex.stop();
+    await this.agent.stop();
     await this.waitForIdle();
     await this.store.close();
   }
@@ -157,19 +157,19 @@ export class BotService {
         await this.messages.sendMarkdown(target, "Current project is no longer configured. Use /projects and /use <project>.");
         return;
       }
-      await this.messages.sendMarkdown(target, "A Codex task is already running. Please wait or use /stop.");
+      await this.messages.sendMarkdown(target, `A ${this.agent.metadata.displayName} task is already running. Please wait or use /stop.`);
       return;
     }
 
     this.sessions.runPromptTask(claimResult.claim, () =>
-      this.runPromptTurn(event, target, claimResult.claim)
+      this.runPrompt(event, target, claimResult.claim)
       .catch(async (error) => {
-        await this.messages.sendMarkdown(target, `Codex turn run failed: ${errorMessage(error)}`);
+        await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} run failed: ${errorMessage(error)}`);
       }),
     );
   }
 
-  private async runPromptTurn(
+  private async runPrompt(
     event: FeishuMessageEvent,
     target: ReplyTarget,
     claim: PromptClaim,
@@ -177,36 +177,42 @@ export class BotService {
     await this.sendPromptAccepted(target, claim.project.key);
 
     if (await this.sessions.isStopRequested(claim)) {
-      await this.messages.sendMarkdown(target, "Codex task was stopped before it started.");
+      await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} task was stopped before it started.`);
       return;
     }
 
-    const threadResult = await this.sessions.ensureThread(claim);
-    if (!threadResult.ok || await this.sessions.isStopRequested(claim)) {
-      await this.messages.sendMarkdown(target, "Codex task was stopped before it started.");
+    const sessionResult = await this.sessions.ensureAgentSession(claim);
+    if (!sessionResult.ok || await this.sessions.isStopRequested(claim)) {
+      await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} task was stopped before it started.`);
       return;
     }
 
-    const reporter = new TurnStatusReporter(this.messages, target, claim.project.key);
+    const reporter = new RunStatusReporter(
+      this.messages,
+      target,
+      claim.project.key,
+      this.agent.metadata.displayName,
+      this.agent.capabilities,
+    );
     await reporter.start();
-    let currentTurnId: string | undefined;
+    let currentRunId: string | undefined;
 
     try {
-      for await (const codexEvent of this.codex.startTurn({
-        threadId: threadResult.thread.id,
+      for await (const agentEvent of this.agent.startRun({
+        sessionId: sessionResult.agentSession.id,
         project: claim.project,
         text: event.content,
         clientUserMessageId: event.messageId,
       })) {
-        await this.handleCodexEvent(codexEvent, claim, target, reporter);
-        if (codexEvent.type === "turn_started") {
-          currentTurnId = codexEvent.turnId;
+        await this.handleAgentEvent(agentEvent, claim, target, reporter);
+        if (agentEvent.type === "run_started") {
+          currentRunId = agentEvent.runId;
         }
       }
     } catch (error) {
       await reporter.fail(errorMessage(error));
-      await this.sessions.failTurn(claim, currentTurnId);
-      await this.messages.sendMarkdown(target, `Codex turn event failed: ${errorMessage(error)}`);
+      await this.sessions.failRun(claim, currentRunId);
+      await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} run event failed: ${errorMessage(error)}`);
       return;
     }
 
@@ -214,30 +220,30 @@ export class BotService {
     if (finalText) {
       await this.messages.sendMarkdown(target, finalText, { replyTo: event.messageId });
     } else if (!(await this.sessions.isStopRequested(claim))) {
-      const turnStatus = reporter.turnStatus();
-      if (turnStatus === "completed") {
-        await this.messages.sendMarkdown(target, "Codex completed without textual output.", { replyTo: event.messageId });
-      } else if (turnStatus !== "interrupted") {
-        await this.messages.sendMarkdown(target, `Codex turn finished with status: ${turnStatus}.`, {
+      const runStatus = reporter.runStatus();
+      if (runStatus === "completed") {
+        await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} completed without textual output.`, { replyTo: event.messageId });
+      } else if (runStatus !== "interrupted") {
+        await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} run finished with status: ${runStatus}.`, {
           replyTo: event.messageId,
         });
       }
     }
-    if (currentTurnId) await this.sessions.completeTurn(claim, currentTurnId);
+    if (currentRunId) await this.sessions.completeRun(claim, currentRunId);
   }
 
-  private async handleCodexEvent(
-    event: CodexEvent,
+  private async handleAgentEvent(
+    event: AgentRunEvent,
     claim: PromptClaim,
     target: ReplyTarget,
-    reporter: TurnStatusReporter,
+    reporter: RunStatusReporter,
   ): Promise<void> {
     switch (event.type) {
-      case "turn_started": {
-        await reporter.turnStarted();
-        const result = await this.sessions.markTurnStarted(claim, event.threadId, event.turnId);
-        if (result.shouldInterrupt) {
-          await this.codex.interruptTurn({ threadId: event.threadId, turnId: event.turnId }).catch(() => undefined);
+      case "run_started": {
+        await reporter.runStarted();
+        const result = await this.sessions.markRunStarted(claim, event.sessionId, event.runId);
+        if (result.shouldInterrupt && this.agent.capabilities.interruptRun) {
+          await this.agent.interruptRun?.({ sessionId: event.sessionId, runId: event.runId }).catch(() => undefined);
         }
         break;
       }
@@ -257,12 +263,20 @@ export class BotService {
         await reporter.diffUpdated(event.changedFiles);
         break;
       case "approval_requested": {
+        if (!this.agent.capabilities.approvals || !this.agent.resolveApproval) {
+          await reporter.warning();
+          await this.messages.sendMarkdown(
+            target,
+            `${this.agent.metadata.displayName} requested approval, but this driver does not support remote approval resolution.`,
+          );
+          break;
+        }
         const shortId = createShortId();
         const pending: PendingApproval = {
           approvalShortId: shortId,
           userOpenId: claim.userOpenId,
-          codexThreadId: event.approval.threadId,
-          turnId: event.approval.turnId,
+          agentSessionId: event.approval.sessionId,
+          runId: event.approval.runId,
           requestId: String(event.approval.requestId),
           approvalKind: event.approval.kind,
           payloadJson: JSON.stringify(event.approval.raw),
@@ -282,16 +296,16 @@ export class BotService {
         await reporter.approvalRequested(event.approval.title);
         break;
       }
-      case "turn_completed":
+      case "run_completed":
         await reporter.completed(event.status);
-        await this.sessions.completeTurn(claim, event.turnId);
+        await this.sessions.completeRun(claim, event.runId);
         break;
       case "warning":
         await reporter.warning();
         break;
       case "error":
         await reporter.fail(event.message);
-        await this.messages.sendMarkdown(target, `Codex error: ${event.message}`);
+        await this.messages.sendMarkdown(target, `${this.agent.metadata.displayName} error: ${event.message}`);
         break;
       default:
         break;
@@ -303,7 +317,7 @@ export class BotService {
     try {
       await this.messages.sendMarkdown(
         target,
-        [`已收到，已进入 ${projectKey} 的 Codex 处理队列。`, "可用 /status 查看状态，/stop 中止。"].join("\n"),
+        [`已收到，已进入 ${projectKey} 的 ${this.agent.metadata.displayName} 处理队列。`, "可用 /status 查看状态，/stop 中止。"].join("\n"),
       );
     } catch (error) {
       console.error("Failed to send prompt accepted feedback", error);
