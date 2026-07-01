@@ -166,6 +166,9 @@ export function getProject(config: AppConfig, key: string | undefined) {
 
 function validateAgent(agent: AgentConfig): void {
   if (!isAgentType(agent.type)) throw new Error(`Unsupported agent type: ${(agent as { type?: string }).type}`);
+  if (agent.displayName !== undefined && (typeof agent.displayName !== "string" || agent.displayName.trim().length === 0)) {
+    throw new Error("Invalid agent.displayName");
+  }
   if (!agent.binaryPath) throw new Error("Missing agent.binaryPath");
   assertSandbox(agent.defaultSandbox);
   assertApprovalPolicy(agent.defaultApprovalPolicy);

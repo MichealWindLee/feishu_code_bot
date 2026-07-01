@@ -62,7 +62,7 @@ export class CodexAppServerDriver implements CodeAgentDriver {
   constructor(private readonly config: AppConfig) {
     this.metadata = {
       id: "codex",
-      displayName: "Codex",
+      displayName: config.agent.displayName ?? "Codex",
     };
   }
 

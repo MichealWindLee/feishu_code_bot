@@ -38,6 +38,7 @@ describe("config", () => {
     const configPath = writeTempConfig({
       agent: {
         type: "codex",
+        displayName: "Work Codex",
         binaryPath: "/bin/codex",
         defaultSandbox: "workspace-write",
         defaultApprovalPolicy: "on-request",
@@ -48,11 +49,12 @@ describe("config", () => {
 
     expect(config.agent).toEqual(expect.objectContaining({
       type: "codex",
+      displayName: "Work Codex",
       binaryPath: "/bin/codex",
     }));
   });
 
-  it("keeps agent metadata out of config normalization", () => {
+  it("does not synthesize agent metadata during config normalization", () => {
     const configPath = writeTempConfig({
       agent: {
         type: "codex",

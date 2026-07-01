@@ -5,6 +5,7 @@ export type AgentType = (typeof AGENT_TYPES)[number];
 
 export interface AgentConfig {
   type: AgentType;
+  displayName?: string;
   binaryPath: string;
   defaultSandbox: SandboxMode;
   defaultApprovalPolicy: ApprovalPolicy;

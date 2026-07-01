@@ -16,7 +16,10 @@ describe("CodexAppServerDriver", () => {
 
   it("speaks the app-server JSON-RPC subset and resolves approvals", async () => {
     const binaryPath = createFakeAppServer();
-    driver = new CodexAppServerDriver(testConfig(binaryPath));
+    const config = testConfig(binaryPath);
+    config.agent.displayName = "Work Codex";
+    driver = new CodexAppServerDriver(config);
+    expect(driver.metadata).toEqual({ id: "codex", displayName: "Work Codex" });
 
     await driver.start();
     const session = await driver.createSession({ project: testProject() });

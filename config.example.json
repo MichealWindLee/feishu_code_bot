@@ -17,6 +17,7 @@
   ],
   "agent": {
     "type": "codex",
+    "displayName": "Codex",
     "binaryPath": "codex",
     "defaultSandbox": "workspace-write",
     "defaultApprovalPolicy": "on-request"

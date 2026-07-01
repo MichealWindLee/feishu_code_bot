@@ -98,7 +98,7 @@ Edit `config.local.json` before starting the service:
 | `feishu.allowedUsers` | Open-id allowlist. An empty array allows all users. |
 | `feishu.allowedChats` | Group-chat allowlist. Group messages must also mention the bot. |
 | `projects` | Static project workspaces that users can select with `/use`. |
-| `agent` | Driver type, binary path, and default sandbox or approval policy. |
+| `agent` | Driver type, optional display name, binary path, and default sandbox or approval policy. |
 | `storage.sqlitePath` | SQLite file used for sessions, approvals, and event deduplication. |
 | `bot.approvalTtlMs` | Pending approval lifetime in milliseconds. |
 | `bot.eventDedupTtlMs` | Feishu event deduplication lifetime in milliseconds. |
