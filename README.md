@@ -111,7 +111,6 @@ FEISHU_CODE_BOT_CONFIG=./config.local.json
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=xxx
 FEISHU_BOT_OPEN_ID=ou_xxx
-CODEX_BINARY_PATH=codex
 SQLITE_PATH=./data/bot.sqlite
 ```
 

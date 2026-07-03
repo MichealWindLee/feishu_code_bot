@@ -74,6 +74,61 @@ describe("config", () => {
     expect(config.agent).not.toHaveProperty("displayName");
   });
 
+  it("loads claude-code agent config without requiring a binary path", () => {
+    const configPath = writeTempConfig({
+      agent: {
+        type: "claude-code",
+        displayName: "Claude",
+        defaultSandbox: "workspace-write",
+        defaultApprovalPolicy: "on-request",
+      },
+    });
+
+    const config = loadConfig({ configPath });
+
+    expect(config.agent).toEqual(expect.objectContaining({
+      type: "claude-code",
+      displayName: "Claude",
+    }));
+    expect(config.agent.binaryPath).toBeUndefined();
+  });
+
+  it("loads codex agent config without normalizing a default binary path", () => {
+    const configPath = writeTempConfig({
+      agent: {
+        type: "codex",
+        defaultSandbox: "workspace-write",
+        defaultApprovalPolicy: "on-request",
+      },
+    });
+
+    const config = loadConfig({ configPath });
+
+    expect(config.agent).toEqual(expect.objectContaining({
+      type: "codex",
+    }));
+    expect(config.agent.binaryPath).toBeUndefined();
+  });
+
+  it("does not override agent binary path from process env", () => {
+    const configPath = writeTempConfig({
+      agent: {
+        type: "codex",
+        binaryPath: "/file/codex",
+        defaultSandbox: "workspace-write",
+        defaultApprovalPolicy: "on-request",
+      },
+    });
+
+    withCleanEnv(["CODEX_BINARY_PATH", "CLAUDE_CODE_BINARY_PATH"], () => {
+      process.env.CODEX_BINARY_PATH = "/env/codex";
+      process.env.CLAUDE_CODE_BINARY_PATH = "/env/claude";
+      const config = loadConfig({ configPath });
+
+      expect(config.agent.binaryPath).toBe("/file/codex");
+    });
+  });
+
   it("loads process env from a dotenv file before applying env overrides", () => {
     const configPath = writeTempConfig({
       feishu: {

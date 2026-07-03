@@ -16,7 +16,6 @@ const defaultConfig: AppConfig = {
   projects: [],
   agent: {
     type: "codex",
-    binaryPath: "codex",
     defaultSandbox: "workspace-write",
     defaultApprovalPolicy: "on-request",
   },
@@ -79,7 +78,6 @@ export function loadConfig(options: LoadConfigOptions | string = {}): AppConfig 
   if (process.env.FEISHU_APP_ID) merged.feishu.appId = process.env.FEISHU_APP_ID;
   if (process.env.FEISHU_APP_SECRET) merged.feishu.appSecret = process.env.FEISHU_APP_SECRET;
   if (process.env.FEISHU_BOT_OPEN_ID) merged.feishu.botOpenId = process.env.FEISHU_BOT_OPEN_ID;
-  if (process.env.CODEX_BINARY_PATH && merged.agent.type === "codex") merged.agent.binaryPath = process.env.CODEX_BINARY_PATH;
   if (process.env.SQLITE_PATH) merged.storage.sqlitePath = process.env.SQLITE_PATH;
   if (loadOptions.debugPromptAcceptedFeedback !== undefined) {
     merged.bot.debugPromptAcceptedFeedback = loadOptions.debugPromptAcceptedFeedback;
@@ -169,7 +167,6 @@ function validateAgent(agent: AgentConfig): void {
   if (agent.displayName !== undefined && (typeof agent.displayName !== "string" || agent.displayName.trim().length === 0)) {
     throw new Error("Invalid agent.displayName");
   }
-  if (!agent.binaryPath) throw new Error("Missing agent.binaryPath");
   assertSandbox(agent.defaultSandbox);
   assertApprovalPolicy(agent.defaultApprovalPolicy);
 }

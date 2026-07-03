@@ -1,12 +1,12 @@
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
-export const AGENT_TYPES = ["codex"] as const;
+export const AGENT_TYPES = ["codex", "claude-code"] as const;
 export type AgentType = (typeof AGENT_TYPES)[number];
 
 export interface AgentConfig {
   type: AgentType;
   displayName?: string;
-  binaryPath: string;
+  binaryPath?: string;
   defaultSandbox: SandboxMode;
   defaultApprovalPolicy: ApprovalPolicy;
   model?: string;

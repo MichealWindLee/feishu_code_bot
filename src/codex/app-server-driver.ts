@@ -68,7 +68,9 @@ export class CodexAppServerDriver implements CodeAgentDriver {
 
   async start(): Promise<void> {
     if (this.proc) return;
-    this.proc = spawn(this.config.agent.binaryPath, ["app-server", "--listen", "stdio://"], {
+    const binaryPath = this.config.agent.binaryPath?.trim();
+    if (!binaryPath) throw new Error("Missing agent.binaryPath for Codex app-server driver");
+    this.proc = spawn(binaryPath, ["app-server", "--listen", "stdio://"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 

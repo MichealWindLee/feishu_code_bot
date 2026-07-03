@@ -106,6 +106,12 @@ describe("CodexAppServerDriver", () => {
     expect((await iterator.next()).done).toBe(true);
     await expect(driver.interruptRun({ sessionId: "thread-1", runId: "turn-1" })).resolves.toBeUndefined();
   });
+
+  it("requires a configured binary path when starting", async () => {
+    driver = new CodexAppServerDriver(testConfig(" "));
+
+    await expect(driver.start()).rejects.toThrow("Missing agent.binaryPath");
+  });
 });
 
 function testConfig(binaryPath: string): AppConfig {
