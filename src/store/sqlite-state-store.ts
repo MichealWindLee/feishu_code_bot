@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import Database from "better-sqlite3";
-import type { CurrentSession, PendingApproval, StateStore } from "./types.js";
+import type { CurrentSession, PendingApproval, PendingUserInput, StateStore } from "./types.js";
 
 type SessionRow = {
   user_open_id: string;
@@ -20,6 +20,17 @@ type ApprovalRow = {
   request_id: string;
   approval_kind: string;
   payload_json: string;
+  expires_at: number;
+};
+
+type UserInputRow = {
+  user_input_short_id: string;
+  user_open_id: string;
+  agent_session_id: string;
+  run_id: string;
+  request_id: string;
+  payload_json: string;
+  response_json: string;
   expires_at: number;
 };
 
@@ -144,6 +155,53 @@ export class SqliteStateStore implements StateStore {
     this.db.prepare("delete from pending_approvals where user_open_id = ?").run(userOpenId);
   }
 
+  async savePendingUserInput(input: PendingUserInput): Promise<void> {
+    this.db
+      .prepare(
+        `
+        insert into pending_user_inputs (
+          user_input_short_id, user_open_id, agent_session_id, run_id, request_id,
+          payload_json, response_json, expires_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(user_input_short_id) do update set
+          payload_json = excluded.payload_json,
+          response_json = excluded.response_json,
+          expires_at = excluded.expires_at
+      `,
+      )
+      .run(
+        input.userInputShortId,
+        input.userOpenId,
+        input.agentSessionId,
+        input.runId,
+        input.requestId,
+        input.payloadJson,
+        input.responseJson,
+        input.expiresAt,
+      );
+  }
+
+  async getPendingUserInput(userInputShortId: string): Promise<PendingUserInput | null> {
+    const row = this.db
+      .prepare("select * from pending_user_inputs where user_input_short_id = ?")
+      .get(userInputShortId) as UserInputRow | undefined;
+    return row ? mapUserInput(row) : null;
+  }
+
+  async updatePendingUserInputResponse(userInputShortId: string, responseJson: string): Promise<void> {
+    this.db
+      .prepare("update pending_user_inputs set response_json = ? where user_input_short_id = ?")
+      .run(responseJson, userInputShortId);
+  }
+
+  async deletePendingUserInput(userInputShortId: string): Promise<void> {
+    this.db.prepare("delete from pending_user_inputs where user_input_short_id = ?").run(userInputShortId);
+  }
+
+  async deletePendingUserInputsForUser(userOpenId: string): Promise<void> {
+    this.db.prepare("delete from pending_user_inputs where user_open_id = ?").run(userOpenId);
+  }
+
   async rememberEvent(eventId: string, expiresAt: number): Promise<boolean> {
     try {
       this.db
@@ -159,6 +217,7 @@ export class SqliteStateStore implements StateStore {
   async cleanupExpired(now: number): Promise<void> {
     this.db.prepare("delete from event_dedup where expires_at <= ?").run(now);
     this.db.prepare("delete from pending_approvals where expires_at <= ?").run(now);
+    this.db.prepare("delete from pending_user_inputs where expires_at <= ?").run(now);
   }
 
   async close(): Promise<void> {
@@ -188,6 +247,17 @@ export class SqliteStateStore implements StateStore {
         expires_at integer not null
       );
 
+      create table if not exists pending_user_inputs (
+        user_input_short_id text primary key,
+        user_open_id text not null,
+        agent_session_id text not null,
+        run_id text not null,
+        request_id text not null,
+        payload_json text not null,
+        response_json text not null,
+        expires_at integer not null
+      );
+
       create table if not exists event_dedup (
         event_id text primary key,
         expires_at integer not null
@@ -195,6 +265,8 @@ export class SqliteStateStore implements StateStore {
 
       create index if not exists idx_pending_approvals_expires_at
         on pending_approvals (expires_at);
+      create index if not exists idx_pending_user_inputs_expires_at
+        on pending_user_inputs (expires_at);
       create index if not exists idx_event_dedup_expires_at
         on event_dedup (expires_at);
     `);
@@ -232,6 +304,19 @@ function mapApproval(row: ApprovalRow): PendingApproval {
     requestId: row.request_id,
     approvalKind: row.approval_kind as PendingApproval["approvalKind"],
     payloadJson: row.payload_json,
+    expiresAt: row.expires_at,
+  };
+}
+
+function mapUserInput(row: UserInputRow): PendingUserInput {
+  return {
+    userInputShortId: row.user_input_short_id,
+    userOpenId: row.user_open_id,
+    agentSessionId: row.agent_session_id,
+    runId: row.run_id,
+    requestId: row.request_id,
+    payloadJson: row.payload_json,
+    responseJson: row.response_json,
     expiresAt: row.expires_at,
   };
 }

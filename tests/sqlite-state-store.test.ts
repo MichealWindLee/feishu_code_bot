@@ -87,4 +87,25 @@ describe("SqliteStateStore", () => {
     expect(await store.getPendingApproval("a2")).toBeTruthy();
     await store.close();
   });
+
+  it("persists and expires pending user input requests", async () => {
+    const store = new SqliteStateStore(":memory:");
+    await store.savePendingUserInput({
+      userInputShortId: "q1",
+      userOpenId: "u1",
+      agentSessionId: "session-1",
+      runId: "run-1",
+      requestId: "ask-1",
+      payloadJson: "{}",
+      responseJson: JSON.stringify({ answers: {} }),
+      expiresAt: Date.now() + 1000,
+    });
+
+    await store.updatePendingUserInputResponse("q1", JSON.stringify({ answers: { Framework: "React" } }));
+    expect((await store.getPendingUserInput("q1"))?.responseJson).toContain("React");
+
+    await store.deletePendingUserInputsForUser("u1");
+    expect(await store.getPendingUserInput("q1")).toBeNull();
+    await store.close();
+  });
 });

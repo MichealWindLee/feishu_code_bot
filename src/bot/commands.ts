@@ -8,7 +8,8 @@ export type BotCommand =
   | { type: "stop" }
   | { type: "permissions" }
   | { type: "approve"; approvalId: string }
-  | { type: "deny"; approvalId: string };
+  | { type: "deny"; approvalId: string }
+  | { type: "answer_user_input"; userInputId: string; questionIndex: number; answer?: string; submit?: boolean };
 
 export function parseCommand(input: string): BotCommand | null {
   const text = input.trim();

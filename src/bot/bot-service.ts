@@ -1,6 +1,7 @@
 import { BotCommandHandler, commandFromActionValue } from "./command-handler.js";
 import { parseCommand } from "./commands.js";
 import { RunStatusReporter } from "./run-status-reporter.js";
+import { renderUserInputCard } from "./user-input-card.js";
 import type { AgentRunEvent, CodeAgentDriver } from "../agent/types.js";
 import type { AppConfig } from "../config/types.js";
 import type {
@@ -13,7 +14,7 @@ import type {
   ReplyTarget,
 } from "../feishu/types.js";
 import { SessionManager, type PromptClaim } from "../session/session-manager.js";
-import type { PendingApproval, StateStore } from "../store/types.js";
+import type { PendingApproval, PendingUserInput, StateStore } from "../store/types.js";
 
 export class BotService {
   private readonly eventTasks = new Set<Promise<void>>();
@@ -136,7 +137,7 @@ export class BotService {
 
   private async handleCardAction(event: FeishuCardActionEvent): Promise<void> {
     if (!this.isAllowedUser(event.operatorId)) return;
-    const command = commandFromActionValue(event.value);
+    const command = commandFromActionValue(event.value, event.option);
     if (!command) return;
     await this.commands.handle(command, event.operatorId, { chatId: event.chatId, messageId: event.messageId });
   }
@@ -294,6 +295,31 @@ export class BotService {
           ].join("\n"),
         );
         await reporter.approvalRequested(event.approval.title);
+        break;
+      }
+      case "user_input_requested": {
+        if (!this.agent.capabilities.userInputRequests || !this.agent.resolveUserInput) {
+          await reporter.warning();
+          await this.messages.sendMarkdown(
+            target,
+            `${this.agent.metadata.displayName} requested user input, but this driver does not support remote answers.`,
+          );
+          break;
+        }
+        const shortId = createShortId();
+        const pending: PendingUserInput = {
+          userInputShortId: shortId,
+          userOpenId: claim.userOpenId,
+          agentSessionId: event.request.sessionId,
+          runId: event.request.runId,
+          requestId: String(event.request.requestId),
+          payloadJson: JSON.stringify(event.request),
+          responseJson: JSON.stringify({ answers: {} }),
+          expiresAt: Date.now() + this.config.bot.approvalTtlMs,
+        };
+        await this.store.savePendingUserInput(pending);
+        await this.messages.sendCard(target, renderUserInputCard(event.request, shortId), { replyTo: target.messageId });
+        await reporter.userInputRequested(event.request.title);
         break;
       }
       case "run_completed":

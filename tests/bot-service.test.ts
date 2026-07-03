@@ -11,6 +11,7 @@ import type {
   CreateAgentSessionInput,
   InterruptAgentRunInput,
   ResolveAgentApprovalInput,
+  ResolveAgentUserInputInput,
   ResumeAgentSessionInput,
   StartAgentRunInput,
 } from "../src/agent/types.js";
@@ -289,6 +290,108 @@ describe("BotService", () => {
     expect(agent.resolvedApprovals).toEqual([]);
   });
 
+  it("stores and resolves user input requests from card actions", async () => {
+    const { service, messages, agent } = makeHarness([
+      { type: "run_started", sessionId: "session-1", runId: "run-1" },
+      {
+        type: "user_input_requested",
+        request: {
+          requestId: "question-1",
+          sessionId: "session-1",
+          runId: "run-1",
+          title: "Test Agent needs your input",
+          body: "Choose a framework.",
+          questions: [
+            {
+              question: "Which framework should we use?",
+              header: "Framework",
+              options: [
+                { label: "React", description: "Use React." },
+                { label: "Vue", description: "Use Vue." },
+              ],
+            },
+          ],
+          raw: { requestId: "question-1" },
+        },
+      },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
+    ]);
+
+    await service.handleEvent(message("ask me"));
+    await service.waitForIdle();
+
+    const actionValue = findActionValue(messages.cards, "answer_user_input");
+    expect(actionValue?.userInputId).toBeTruthy();
+
+    await service.handleEvent(cardAction({
+      action: "answer_user_input",
+      userInputId: actionValue?.userInputId,
+      questionIndex: 0,
+      answer: "React",
+    }));
+    await service.waitForIdle();
+
+    expect(agent.resolvedUserInputs).toEqual([
+      expect.objectContaining({
+        requestId: "question-1",
+        response: { answers: { "Which framework should we use?": "React" } },
+      }),
+    ]);
+  });
+
+  it("uses a dropdown for large single-choice user input cards", async () => {
+    const { service, messages, agent } = makeHarness([
+      { type: "run_started", sessionId: "session-1", runId: "run-1" },
+      {
+        type: "user_input_requested",
+        request: {
+          requestId: "question-1",
+          sessionId: "session-1",
+          runId: "run-1",
+          title: "Need input",
+          body: "",
+          questions: [
+            {
+              question: "Which framework should we use?",
+              header: "Framework",
+              options: [
+                { label: "React", description: "Use React." },
+                { label: "Vue", description: "Use Vue." },
+                { label: "Svelte", description: "Use Svelte." },
+                { label: "Solid", description: "Use Solid." },
+                { label: "Angular", description: "Use Angular." },
+              ],
+            },
+          ],
+          raw: { requestId: "question-1" },
+        },
+      },
+      { type: "run_completed", sessionId: "session-1", runId: "run-1", status: "completed" },
+    ]);
+
+    await service.handleEvent(message("ask me"));
+    await service.waitForIdle();
+
+    const cardJson = JSON.stringify(messages.cards.at(-1));
+    expect(cardJson).toContain("\"tag\":\"select_static\"");
+    expect(cardJson).toContain("Angular");
+    expect(cardJson).toContain("请补充信息，以便继续处理。");
+    expect(cardJson).not.toContain("Claude Code needs your input.");
+
+    const actionValue = findActionValue(messages.cards, "answer_user_input");
+    expect(actionValue?.userInputId).toBeTruthy();
+
+    await service.handleEvent(cardAction(actionValue, { tag: "select_static", option: "Svelte" }));
+    await service.waitForIdle();
+
+    expect(agent.resolvedUserInputs).toEqual([
+      expect.objectContaining({
+        requestId: "question-1",
+        response: { answers: { "Which framework should we use?": "Svelte" } },
+      }),
+    ]);
+  });
+
   it("acks Feishu events before a slow agent run completes", async () => {
     const release = deferred<void>();
     const { service, agent } = makeHarness(async function* (input) {
@@ -493,6 +596,38 @@ function message(content: string): FeishuInboundEvent {
   };
 }
 
+function cardAction(value: unknown, overrides: Partial<Extract<FeishuInboundEvent, { kind: "card_action" }>> = {}): FeishuInboundEvent {
+  return {
+    kind: "card_action",
+    eventId: `card-${Math.random()}`,
+    actionId: `action-${Math.random()}`,
+    messageId: `card-message-${Math.random()}`,
+    chatId: "chat-1",
+    operatorId: "u1",
+    tag: "button",
+    value,
+    ...overrides,
+  };
+}
+
+function findActionValue(cards: object[], action: string): Record<string, unknown> | null {
+  const stack: unknown[] = [...cards];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (!value || typeof value !== "object") continue;
+    const record = value as Record<string, unknown>;
+    if (record.value && typeof record.value === "object") {
+      const actionValue = record.value as Record<string, unknown>;
+      if (actionValue.action === action) return actionValue;
+    }
+    for (const child of Object.values(record)) {
+      if (Array.isArray(child)) stack.push(...child);
+      else if (child && typeof child === "object") stack.push(child);
+    }
+  }
+  return null;
+}
+
 class FakeGateway implements FeishuGateway {
   handler: ((event: FeishuInboundEvent) => void | Promise<void>) | null = null;
 
@@ -531,6 +666,7 @@ class FakeAgent implements CodeAgentDriver {
     approvals: true,
     planUpdates: true,
     fileDiffs: true,
+    userInputRequests: true,
   };
 
   createdSessions: CreateAgentSessionInput[] = [];
@@ -538,6 +674,7 @@ class FakeAgent implements CodeAgentDriver {
   runInputs: StartAgentRunInput[] = [];
   interruptedRuns: InterruptAgentRunInput[] = [];
   resolvedApprovals: ResolveAgentApprovalInput[] = [];
+  resolvedUserInputs: ResolveAgentUserInputInput[] = [];
 
   constructor(private readonly events?: FakeAgentEvents, capabilityOverrides: Partial<AgentCapabilities> = {}) {
     this.capabilities = { ...this.capabilities, ...capabilityOverrides };
@@ -576,6 +713,10 @@ class FakeAgent implements CodeAgentDriver {
 
   async resolveApproval(input: ResolveAgentApprovalInput): Promise<void> {
     this.resolvedApprovals.push(input);
+  }
+
+  async resolveUserInput(input: ResolveAgentUserInputInput): Promise<void> {
+    this.resolvedUserInputs.push(input);
   }
 }
 

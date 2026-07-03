@@ -269,6 +269,7 @@ export class SessionManager {
         });
       }
       await this.store.deletePendingApprovalsForUser(userOpenId);
+      await this.store.deletePendingUserInputsForUser(userOpenId);
       this.runtime.deleteSessionState(userOpenId);
     });
     return { status: "ended" };

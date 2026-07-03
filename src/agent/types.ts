@@ -36,6 +36,8 @@ export interface AgentCapabilities {
   planUpdates: boolean;
   /** 是否会产出 diff_updated 事件；不支持时状态卡不展示 diff 区域。 */
   fileDiffs: boolean;
+  /** 是否可能在 run 中向用户发起澄清问题。 */
+  userInputRequests?: boolean;
   /**
    * 是否支持进程级控制能力，例如强制 kill agent 子进程。
    * 这不是主 session/run 协议的必需能力，保留给 /kill 这类运维命令判断。
@@ -193,6 +195,8 @@ export type AgentRunEvent =
   | { type: "diff_updated"; sessionId: string; runId: string; diff: string; changedFiles: string[] }
   /** Agent 请求用户审批；仅当 capabilities.approvals 为 true 时使用。 */
   | { type: "approval_requested"; approval: AgentApprovalRequest }
+  /** Agent 请求用户回答澄清问题；仅当 capabilities.userInputRequests 为 true 时使用。 */
+  | { type: "user_input_requested"; request: AgentUserInputRequest }
   /** run 进入终态。发出该事件后，事件流通常应尽快结束。 */
   | { type: "run_completed"; sessionId: string; runId: string; status: AgentRunStatus }
   /** 非致命告警，可关联到 session，也可作为全局 driver 告警。 */
@@ -208,6 +212,46 @@ export interface ResolveAgentApprovalInput {
   /** true 表示批准，false 表示拒绝。 */
   approved: boolean;
   /** approval_requested.raw 的原样回传，供 driver 调用底层协议。 */
+  raw: unknown;
+}
+
+export interface AgentUserInputOption {
+  label: string;
+  description: string;
+  preview?: string;
+}
+
+export interface AgentUserInputQuestion {
+  question: string;
+  header: string;
+  options: AgentUserInputOption[];
+  multiSelect?: boolean;
+}
+
+export interface AgentUserInputRequest {
+  /** Driver 原始请求 id；BotService 原样回传给 resolveUserInput。 */
+  requestId: string | number;
+  /** 提问所属的 session id。 */
+  sessionId: string;
+  /** 提问所属的 run id。 */
+  runId: string;
+  /** 用户可见标题。 */
+  title: string;
+  /** 用户可见正文说明。 */
+  body: string;
+  /** Agent 需要用户回答的问题列表。 */
+  questions: AgentUserInputQuestion[];
+  /** Driver 私有 payload，resolveUserInput 时原样传回。 */
+  raw: unknown;
+}
+
+export interface AgentUserInputResponse {
+  answers: Record<string, string | string[]>;
+}
+
+export interface ResolveAgentUserInputInput {
+  requestId: string | number;
+  response: AgentUserInputResponse;
   raw: unknown;
 }
 
@@ -262,4 +306,9 @@ export interface CodeAgentDriver {
    * 调用底层协议，并把 approved 映射为具体 agent 的允许/拒绝语义。
    */
   resolveApproval?(input: ResolveAgentApprovalInput): Promise<void>;
+  /**
+   * 响应 agent 发起的用户澄清问题。
+   * 仅当 capabilities.userInputRequests 为 true 时实现和调用。
+   */
+  resolveUserInput?(input: ResolveAgentUserInputInput): Promise<void>;
 }

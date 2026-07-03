@@ -1,6 +1,7 @@
 import { commandHelp, parseCommand, type BotCommand } from "./commands.js";
+import { renderUserInputCard } from "./user-input-card.js";
 import { getProject } from "../config/index.js";
-import type { CodeAgentDriver } from "../agent/types.js";
+import type { AgentUserInputRequest, AgentUserInputResponse, CodeAgentDriver } from "../agent/types.js";
 import type { AppConfig } from "../config/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
 import type { SessionManager, SessionStatus } from "../session/session-manager.js";
@@ -48,6 +49,9 @@ export class BotCommandHandler {
         return;
       case "deny":
         await this.handleApproval(command.approvalId, false, userOpenId, target);
+        return;
+      case "answer_user_input":
+        await this.handleUserInput(command, userOpenId, target);
         return;
       default:
         await this.deps.messages.sendMarkdown(target, "Unsupported command.");
@@ -168,12 +172,72 @@ export class BotCommandHandler {
     await this.deps.messages.sendMarkdown(target, `${approved ? "Approved" : "Denied"} ${approvalId}.`);
   }
 
+  private async handleUserInput(
+    command: Extract<BotCommand, { type: "answer_user_input" }>,
+    userOpenId: string,
+    target: ReplyTarget,
+  ): Promise<void> {
+    const pending = await this.deps.store.getPendingUserInput(command.userInputId);
+    if (!pending) {
+      await this.deps.messages.sendMarkdown(target, `No pending question found for ${command.userInputId}.`);
+      return;
+    }
+    if (pending.expiresAt <= Date.now()) {
+      await this.deps.store.deletePendingUserInput(command.userInputId);
+      await this.deps.messages.sendMarkdown(target, `Question ${command.userInputId} has expired.`);
+      return;
+    }
+    if (pending.userOpenId !== userOpenId) {
+      await this.deps.messages.sendMarkdown(target, `Only the user who triggered the ${this.deps.agent.metadata.displayName} request can answer it.`);
+      return;
+    }
+    if (!this.deps.agent.capabilities.userInputRequests || !this.deps.agent.resolveUserInput) {
+      await this.deps.messages.sendMarkdown(target, `${this.deps.agent.metadata.displayName} does not support remote user input.`);
+      return;
+    }
+
+    const request = JSON.parse(pending.payloadJson) as AgentUserInputRequest;
+    const response = readUserInputResponse(pending.responseJson);
+    const question = request.questions[command.questionIndex];
+    if (!question) {
+      await this.deps.messages.sendMarkdown(target, `Question ${command.userInputId} is no longer valid.`);
+      return;
+    }
+
+    if (command.answer) {
+      if (question.multiSelect) {
+        const current = response.answers[question.question];
+        const selected = new Set(Array.isArray(current) ? current : current ? [current] : []);
+        if (selected.has(command.answer)) selected.delete(command.answer);
+        else selected.add(command.answer);
+        response.answers[question.question] = [...selected];
+      } else {
+        response.answers[question.question] = command.answer;
+      }
+    }
+
+    if ((question.multiSelect && !command.submit) || !isUserInputComplete(request, response)) {
+      await this.deps.store.updatePendingUserInputResponse(command.userInputId, JSON.stringify(response));
+      await this.deps.messages.sendCard(target, renderUserInputCard(request, command.userInputId, response));
+      return;
+    }
+
+    const raw = JSON.parse(pending.payloadJson) as { requestId?: string | number; raw?: unknown };
+    await this.deps.agent.resolveUserInput({
+      requestId: raw.requestId ?? pending.requestId,
+      response,
+      raw: raw.raw ?? raw,
+    });
+    await this.deps.store.deletePendingUserInput(command.userInputId);
+    await this.deps.messages.sendMarkdown(target, `Answered ${command.userInputId}.`);
+  }
+
   private formatProjects(): string {
     return this.deps.config.projects.map((project) => `- ${project.key}: ${project.name}`).join("\n");
   }
 }
 
-export function commandFromActionValue(value: unknown): BotCommand | null {
+export function commandFromActionValue(value: unknown, option?: string): BotCommand | null {
   if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
   if (typeof record.command === "string") return parseCommand(record.command);
@@ -183,7 +247,38 @@ export function commandFromActionValue(value: unknown): BotCommand | null {
   if (typeof record.approvalId === "string" && record.action === "deny") {
     return { type: "deny", approvalId: record.approvalId };
   }
+  if ((record.action === "answer_user_input" || record.action === "submit_user_input") && typeof record.userInputId === "string") {
+    const questionIndex = typeof record.questionIndex === "number" ? record.questionIndex : Number(record.questionIndex);
+    if (!Number.isInteger(questionIndex) || questionIndex < 0) return null;
+    return {
+      type: "answer_user_input",
+      userInputId: record.userInputId,
+      questionIndex,
+      answer: typeof record.answer === "string" ? record.answer : option,
+      submit: record.action === "submit_user_input",
+    };
+  }
   return null;
+}
+
+function readUserInputResponse(responseJson: string): AgentUserInputResponse {
+  try {
+    const response = JSON.parse(responseJson) as AgentUserInputResponse;
+    if (response && typeof response === "object" && response.answers && typeof response.answers === "object") {
+      return response;
+    }
+  } catch {
+    // Corrupt partial answers should not prevent the user from answering again.
+  }
+  return { answers: {} };
+}
+
+function isUserInputComplete(request: AgentUserInputRequest, response: AgentUserInputResponse): boolean {
+  return request.questions.every((question) => {
+    const value = response.answers[question.question];
+    if (question.multiSelect) return Array.isArray(value) && value.length > 0;
+    return typeof value === "string" && value.length > 0;
+  });
 }
 
 function statusLabel(status: SessionStatus): string {

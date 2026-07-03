@@ -1,7 +1,7 @@
 import type { AgentCapabilities, AgentItemSummary, AgentMessagePhase, AgentPlanStep } from "../agent/types.js";
 import type { FeishuMessagePort, ReplyTarget } from "../feishu/types.js";
 
-type RunCardStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "interrupted";
+type RunCardStatus = "queued" | "running" | "waiting_approval" | "waiting_user_input" | "completed" | "failed" | "interrupted";
 
 const PROGRESS_UPDATE_INTERVAL_MS = 20_000;
 const MIN_PROGRESS_DELTA_LENGTH = 40;
@@ -21,6 +21,7 @@ export class RunStatusReporter {
   private commandCount = 0;
   private toolCount = 0;
   private approvalCount = 0;
+  private userInputCount = 0;
   private warningCount = 0;
 
   constructor(
@@ -110,6 +111,13 @@ export class RunStatusReporter {
     await this.createOrUpdateCard();
   }
 
+  async userInputRequested(title: string): Promise<void> {
+    this.status = "waiting_user_input";
+    this.current = title;
+    this.userInputCount += 1;
+    await this.createOrUpdateCard();
+  }
+
   async warning(): Promise<void> {
     this.warningCount += 1;
     this.current = `${this.agentDisplayName} 返回提示`;
@@ -150,6 +158,7 @@ export class RunStatusReporter {
       commandCount: this.commandCount,
       toolCount: this.toolCount,
       approvalCount: this.approvalCount,
+      userInputCount: this.userInputCount,
       warningCount: this.warningCount,
     });
 
@@ -200,6 +209,7 @@ type RunCardState = {
   commandCount: number;
   toolCount: number;
   approvalCount: number;
+  userInputCount: number;
   warningCount: number;
 };
 
@@ -208,7 +218,7 @@ function renderRunStatusCard(state: RunCardState): object {
     `**状态**：${statusLabel(state.status)}`,
     `**项目**：${state.projectKey}`,
     `**当前**：${truncate(state.current, 160)}`,
-    `**活动摘要**：命令 ${state.commandCount} 个，工具 ${state.toolCount} 个，文件 ${state.changedFiles.length} 个，审批 ${state.approvalCount} 个`,
+    `**活动摘要**：命令 ${state.commandCount} 个，工具 ${state.toolCount} 个，文件 ${state.changedFiles.length} 个，审批 ${state.approvalCount} 个，提问 ${state.userInputCount} 个`,
     state.warningCount > 0 ? `**提示**：${state.warningCount} 条` : null,
   ].filter(Boolean).join("\n");
 
@@ -287,6 +297,8 @@ function statusLabel(status: RunCardStatus): string {
       return "执行中";
     case "waiting_approval":
       return "等待审批";
+    case "waiting_user_input":
+      return "等待回答";
     case "completed":
       return "已完成";
     case "failed":
@@ -305,6 +317,7 @@ function statusTemplate(status: RunCardStatus): string {
     case "interrupted":
       return "grey";
     case "waiting_approval":
+    case "waiting_user_input":
       return "orange";
     case "queued":
     case "running":
