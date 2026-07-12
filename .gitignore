@@ -5,7 +5,8 @@ node_modules/
 dist/
 data/
 .env
-config.local.json
+config.*.json
+!config.example.json
 *.db
 *.db-shm
 *.db-wal

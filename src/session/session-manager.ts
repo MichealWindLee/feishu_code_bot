@@ -322,14 +322,16 @@ export class SessionManager {
   }
 
   async switchProject(userOpenId: string, chatId: string, projectKey: string): Promise<SwitchProjectResult> {
-    return this.withUserLock(userOpenId, async () => {
+    let previousSession: CurrentSession | null = null;
+    const result: SwitchProjectResult = await this.withUserLock(userOpenId, async () => {
       const project = getProject(this.config, projectKey);
-      if (!project) return { status: "unknown_project", projectKey };
+      if (!project) return { status: "unknown_project" as const, projectKey };
 
       const session = await this.ensureSessionUnlocked(userOpenId, chatId);
       const snapshot = this.snapshotFrom(userOpenId, session);
-      if (snapshot.status !== "idle") return { status: "busy", currentStatus: snapshot.status };
+      if (snapshot.status !== "idle") return { status: "busy" as const, currentStatus: snapshot.status };
 
+      previousSession = session;
       await this.store.upsertCurrentSession({
         userOpenId,
         projectKey: project.key,
@@ -338,8 +340,10 @@ export class SessionManager {
         lastChatId: chatId,
         updatedAt: Date.now(),
       });
-      return { status: "switched", projectKey: project.key, projectName: project.name };
+      return { status: "switched" as const, projectKey: project.key, projectName: project.name };
     });
+    if (result.status === "switched") await this.disposeSessionIfSupported(previousSession);
+    return result;
   }
 
   private async finishPrompt(claim: PromptClaim): Promise<void> {

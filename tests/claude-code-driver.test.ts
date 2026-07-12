@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { query, type HookJSONOutput, type Options, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { query, type HookJSONOutput, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeCodeDriver } from "../src/claude-code/claude-code-driver.js";
 import type { AppConfig, ProjectConfig } from "../src/config/types.js";
 
@@ -8,17 +8,28 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 describe("ClaudeCodeDriver", () => {
-  it("aborts the active single-message query when interrupted", async () => {
+  beforeEach(() => {
+    vi.mocked(query).mockReset();
+  });
+
+  it("interrupts the active run through the long-lived session query", async () => {
     const queryMock = vi.mocked(query);
-    let abortController: AbortController | undefined;
+    const close = vi.fn();
+    let interrupt!: ReturnType<typeof vi.fn>;
+    let resolveInterrupted!: () => void;
+    const interrupted = new Promise<void>((resolve) => {
+      resolveInterrupted = resolve;
+    });
+
     queryMock.mockImplementationOnce((params) => {
-      abortController = params.options?.abortController;
-      return makeQuery(async function* () {
-        await new Promise<void>((resolve) => {
-          abortController?.signal.addEventListener("abort", () => resolve(), { once: true });
-        });
-        yield resultMessage("aborted");
+      interrupt = vi.fn(async () => {
+        resolveInterrupted();
       });
+      return makeQuery(async function* () {
+        await nextUserText(params.prompt);
+        await interrupted;
+        yield resultMessage("aborted");
+      }, { close, interrupt });
     });
 
     const driver = new ClaudeCodeDriver(testConfig());
@@ -35,11 +46,11 @@ describe("ClaudeCodeDriver", () => {
       sessionId: session.id,
       runId: expect.any(String),
     });
-    expect(abortController?.signal.aborted).toBe(false);
 
     await driver.interruptRun({ sessionId: session.id, runId: started.runId });
 
-    expect(abortController?.signal.aborted).toBe(true);
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    expect(close).not.toHaveBeenCalled();
     expect((await iterator.next()).value).toEqual(expect.objectContaining({
       type: "agent_delta",
       delta: "aborted",
@@ -50,10 +61,11 @@ describe("ClaudeCodeDriver", () => {
     }));
   });
 
-  it("routes Claude Code tool permissions through approval events", async () => {
+  it("routes Claude Code tool permissions through the current run", async () => {
     const queryMock = vi.mocked(query);
     let permissionResult: unknown;
     queryMock.mockImplementationOnce((params) => makeQuery(async function* () {
+      await nextUserText(params.prompt);
       permissionResult = await params.options?.canUseTool?.(
         "Bash",
         { command: "pnpm test" },
@@ -75,7 +87,8 @@ describe("ClaudeCodeDriver", () => {
       text: "run tests",
     })[Symbol.asyncIterator]();
 
-    expect((await iterator.next()).value).toEqual({
+    const started = (await iterator.next()).value;
+    expect(started).toEqual({
       type: "run_started",
       sessionId: session.id,
       runId: expect.any(String),
@@ -86,6 +99,7 @@ describe("ClaudeCodeDriver", () => {
       type: "approval_requested",
       approval: expect.objectContaining({
         kind: "command",
+        requestId: `${started.runId}:tool-1`,
         title: "Run command",
         body: expect.stringContaining("pnpm test"),
       }),
@@ -109,10 +123,11 @@ describe("ClaudeCodeDriver", () => {
     }));
   });
 
-  it("routes AskUserQuestion through user input events", async () => {
+  it("routes AskUserQuestion through the current run", async () => {
     const queryMock = vi.mocked(query);
     let hookResult: HookJSONOutput | undefined;
     queryMock.mockImplementationOnce((params) => makeQuery(async function* () {
+      await nextUserText(params.prompt);
       const hook = params.options?.hooks?.PreToolUse?.[0]?.hooks[0];
       if (!hook) throw new Error("missing AskUserQuestion hook");
       hookResult = await hook(
@@ -151,11 +166,12 @@ describe("ClaudeCodeDriver", () => {
       text: "ask user",
     })[Symbol.asyncIterator]();
 
-    await iterator.next();
+    const started = (await iterator.next()).value;
     const questionEvent = (await iterator.next()).value;
     expect(questionEvent).toEqual({
       type: "user_input_requested",
       request: expect.objectContaining({
+        requestId: `${started.runId}:ask-1`,
         title: "Claude Code 需要你的反馈",
         questions: [expect.objectContaining({ question: "Which framework should we use?" })],
       }),
@@ -182,39 +198,101 @@ describe("ClaudeCodeDriver", () => {
     });
   });
 
-  it("closes the run event stream as soon as Claude returns a result", async () => {
+  it("reuses one session query for consecutive runs and closes only the run streams on results", async () => {
+    const queryMock = vi.mocked(query);
+    const close = vi.fn();
+    const seenPrompts: string[] = [];
+    queryMock.mockImplementationOnce((params) => makeQuery(async function* () {
+      for await (const message of userMessages(params.prompt)) {
+        const text = textFromUserMessage(message);
+        seenPrompts.push(text);
+        yield resultMessage(`done: ${text}`);
+      }
+    }, { close }));
+
+    const driver = new ClaudeCodeDriver(testConfig());
+    const project = testProject();
+    const session = await driver.createSession({ project });
+
+    const first = driver.startRun({ sessionId: session.id, project, text: "first" })[Symbol.asyncIterator]();
+    await first.next();
+    expect((await first.next()).value).toEqual(expect.objectContaining({ type: "agent_delta", delta: "done: first" }));
+    expect((await first.next()).value).toEqual(expect.objectContaining({ type: "run_completed" }));
+    expect(await first.next()).toEqual({ value: undefined, done: true });
+
+    const second = driver.startRun({ sessionId: session.id, project, text: "second" })[Symbol.asyncIterator]();
+    await second.next();
+    expect((await second.next()).value).toEqual(expect.objectContaining({ type: "agent_delta", delta: "done: second" }));
+    expect((await second.next()).value).toEqual(expect.objectContaining({ type: "run_completed" }));
+    expect(await second.next()).toEqual({ value: undefined, done: true });
+
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    expect(seenPrompts).toEqual(["first", "second"]);
+    expect(close).not.toHaveBeenCalled();
+
+    await driver.disposeSession({ sessionId: session.id, project });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects concurrent runs on the same session connection", async () => {
+    const queryMock = vi.mocked(query);
+    queryMock.mockImplementationOnce(() => makeQuery(async function* () {
+      await new Promise<void>(() => undefined);
+    }));
+
+    const driver = new ClaudeCodeDriver(testConfig());
+    const project = testProject();
+    const session = await driver.createSession({ project });
+
+    await driver.startRun({ sessionId: session.id, project, text: "first" })[Symbol.asyncIterator]().next();
+
+    const second = driver.startRun({ sessionId: session.id, project, text: "second" })[Symbol.asyncIterator]();
+    await expect(second.next()).rejects.toThrow("already has an active run");
+    await driver.stop();
+  });
+
+  it("marks an active run interrupted when the session is disposed", async () => {
     const queryMock = vi.mocked(query);
     const close = vi.fn();
     queryMock.mockImplementationOnce(() => makeQuery(async function* () {
-      yield resultMessage("done");
       await new Promise<void>(() => undefined);
     }, { close }));
 
     const driver = new ClaudeCodeDriver(testConfig());
-    const session = await driver.createSession({ project: testProject() });
-    const iterator = driver.startRun({
-      sessionId: session.id,
-      project: testProject(),
-      text: "finish",
-    })[Symbol.asyncIterator]();
+    const project = testProject();
+    const session = await driver.createSession({ project });
+    const iterator = driver.startRun({ sessionId: session.id, project, text: "work" })[Symbol.asyncIterator]();
 
     await iterator.next();
-    expect((await iterator.next()).value).toEqual(expect.objectContaining({
-      type: "agent_delta",
-      delta: "done",
-    }));
+    await driver.disposeSession({ sessionId: session.id, project });
+
     expect((await iterator.next()).value).toEqual(expect.objectContaining({
       type: "run_completed",
-      status: "completed",
+      status: "interrupted",
     }));
+    expect(await iterator.next()).toEqual({ value: undefined, done: true });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
 
-    const timeout = Symbol("timeout");
-    const done = await Promise.race([
-      iterator.next(),
-      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 50)),
-    ]);
-    expect(done).toEqual({ value: undefined, done: true });
-    expect(close).not.toHaveBeenCalled();
+  it("closes all session queries when stopped", async () => {
+    const queryMock = vi.mocked(query);
+    const close = vi.fn();
+    queryMock.mockImplementation(() => makeQuery(async function* () {
+      await new Promise<void>(() => undefined);
+    }, { close }));
+
+    const driver = new ClaudeCodeDriver(testConfig());
+    const project = testProject();
+    const firstSession = await driver.createSession({ project });
+    const secondSession = await driver.createSession({ project });
+
+    await driver.startRun({ sessionId: firstSession.id, project, text: "one" })[Symbol.asyncIterator]().next();
+    await driver.startRun({ sessionId: secondSession.id, project, text: "two" })[Symbol.asyncIterator]().next();
+
+    await driver.stop();
+
+    expect(queryMock).toHaveBeenCalledTimes(2);
+    expect(close).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -248,6 +326,34 @@ function makeQuery(factory: () => AsyncGenerator<SDKMessage, void>, overrides: P
     backgroundTasks: vi.fn(),
     close: vi.fn(),
   }, overrides) as unknown as Query;
+}
+
+async function nextUserText(prompt: string | AsyncIterable<SDKUserMessage>): Promise<string> {
+  for await (const message of userMessages(prompt)) return textFromUserMessage(message);
+  throw new Error("No user message received");
+}
+
+async function* userMessages(prompt: string | AsyncIterable<SDKUserMessage>): AsyncIterable<SDKUserMessage> {
+  if (typeof prompt === "string") {
+    yield {
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: prompt }] },
+      parent_tool_use_id: null,
+    };
+    return;
+  }
+  yield* prompt;
+}
+
+function textFromUserMessage(message: SDKUserMessage): string {
+  const content = message.message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((block) => {
+    if (typeof block !== "object" || block === null) return "";
+    const record = block as unknown as Record<string, unknown>;
+    return record.type === "text" && typeof record.text === "string" ? record.text : "";
+  }).join("");
 }
 
 function resultMessage(result: string): SDKMessage {

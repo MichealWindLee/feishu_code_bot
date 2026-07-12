@@ -3,6 +3,7 @@ import {
   query,
   type Options,
   type Query,
+  type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AsyncQueue } from "../shared/async-queue.js";
 import type { AppConfig } from "../config/types.js";
@@ -12,6 +13,7 @@ import type {
   AgentSession,
   CodeAgentDriver,
   CreateAgentSessionInput,
+  DisposeAgentSessionInput,
   InterruptAgentRunInput,
   ResolveAgentApprovalInput,
   ResolveAgentUserInputInput,
@@ -19,12 +21,18 @@ import type {
   StartAgentRunInput,
 } from "../agent/types.js";
 import { ClaudeCodeEventMapper } from "./events.js";
-import { ClaudeCodeInteractions } from "./interactions.js";
+import { ClaudeCodeInteractions, type ClaudeCodeInteractionRunContext } from "./interactions.js";
 import { toClaudePermissionMode, toClaudeSandbox } from "./permissions.js";
 
-type ActiveQuery = {
+type ActiveClaudeRun = ClaudeCodeInteractionRunContext;
+
+type ClaudeCodeSessionConnection = {
+  sessionId: string;
   query: Query;
-  abortController: AbortController;
+  inputQueue: AsyncQueue<SDKUserMessage>;
+  consumeTask: Promise<void>;
+  currentRun?: ActiveClaudeRun;
+  closed: boolean;
 };
 
 export class ClaudeCodeDriver implements CodeAgentDriver {
@@ -40,7 +48,8 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
   };
 
   private readonly loadedSessions = new Set<string>();
-  private readonly activeQueries = new Map<string, ActiveQuery>();
+  private readonly sessionConnections = new Map<string, ClaudeCodeSessionConnection>();
+  private readonly runConnections = new Map<string, ClaudeCodeSessionConnection>();
   private readonly eventMapper = new ClaudeCodeEventMapper();
   private readonly interactions: ClaudeCodeInteractions;
 
@@ -55,13 +64,14 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
   async start(): Promise<void> {}
 
   async stop(): Promise<void> {
-    for (const activeQuery of this.activeQueries.values()) {
-      activeQuery.abortController.abort();
-      activeQuery.query.close();
+    const error = new Error("Claude Code driver stopped");
+    for (const connection of this.sessionConnections.values()) {
+      this.closeConnection(connection, error);
     }
-    this.activeQueries.clear();
+    this.sessionConnections.clear();
+    this.runConnections.clear();
     this.eventMapper.clear();
-    this.interactions.rejectPending(new Error("Claude Code driver stopped"));
+    this.interactions.rejectPending(error);
   }
 
   async createSession(_input: CreateAgentSessionInput): Promise<AgentSession> {
@@ -73,24 +83,35 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
     return { id: input.sessionId, resumeSupported: true };
   }
 
+  async disposeSession(input: DisposeAgentSessionInput): Promise<void> {
+    const connection = this.sessionConnections.get(input.sessionId);
+    if (!connection) return;
+    this.closeConnection(connection, new Error("Claude Code session disposed"));
+    this.sessionConnections.delete(input.sessionId);
+  }
+
   async *startRun(input: StartAgentRunInput): AsyncIterable<AgentRunEvent> {
+    const connection = this.ensureConnection(input);
+    if (connection.currentRun) {
+      throw new Error(`Claude Code session ${input.sessionId} already has an active run`);
+    }
+
     const runId = randomUUID();
     const queue = new AsyncQueue<AgentRunEvent>();
-    queue.push({ type: "run_started", sessionId: input.sessionId, runId });
+    const activeRun: ActiveClaudeRun = { input, runId, queue };
+    connection.currentRun = activeRun;
+    this.runConnections.set(runId, connection);
 
-    const abortController = new AbortController();
-    const queryInstance = query({
-      prompt: input.text,
-      options: this.queryOptions(input, runId, queue, abortController),
-    });
-    this.activeQueries.set(runId, { query: queryInstance, abortController });
-    void this.consumeQuery(input.sessionId, runId, queryInstance, queue);
+    queue.push({ type: "run_started", sessionId: input.sessionId, runId });
+    connection.inputQueue.push(toSdkUserMessage(input.text));
 
     for await (const event of queue) yield event;
   }
 
   async interruptRun(input: InterruptAgentRunInput): Promise<void> {
-    this.activeQueries.get(input.runId)?.abortController.abort();
+    const connection = this.runConnections.get(input.runId) ?? this.sessionConnections.get(input.sessionId);
+    if (connection?.currentRun?.runId !== input.runId) return;
+    await connection.query.interrupt();
   }
 
   async resolveApproval(input: ResolveAgentApprovalInput): Promise<void> {
@@ -101,16 +122,35 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
     await this.interactions.resolveUserInput(input);
   }
 
+  private ensureConnection(input: StartAgentRunInput): ClaudeCodeSessionConnection {
+    const existing = this.sessionConnections.get(input.sessionId);
+    if (existing && !existing.closed) return existing;
+
+    const inputQueue = new AsyncQueue<SDKUserMessage>();
+    const connection: ClaudeCodeSessionConnection = {
+      sessionId: input.sessionId,
+      query: undefined as unknown as Query,
+      inputQueue,
+      consumeTask: Promise.resolve(),
+      closed: false,
+    };
+    const queryInstance = query({
+      prompt: inputQueue,
+      options: this.queryOptions(input, connection),
+    });
+    connection.query = queryInstance;
+    connection.consumeTask = this.consumeConnection(connection);
+    this.sessionConnections.set(input.sessionId, connection);
+    return connection;
+  }
+
   private queryOptions(
     input: StartAgentRunInput,
-    runId: string,
-    queue: AsyncQueue<AgentRunEvent>,
-    abortController: AbortController,
+    connection: ClaudeCodeSessionConnection,
   ): Options {
     const wasLoaded = this.loadedSessions.has(input.sessionId);
     this.loadedSessions.add(input.sessionId);
     return {
-      abortController,
       cwd: input.project.path,
       model: input.project.model ?? this.config.agent.model,
       pathToClaudeCodeExecutable: this.config.agent.binaryPath,
@@ -120,12 +160,12 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
       permissionMode: toClaudePermissionMode(input.project.approvalPolicy ?? this.config.agent.defaultApprovalPolicy),
       sandbox: toClaudeSandbox(input.project.sandbox ?? this.config.agent.defaultSandbox),
       includePartialMessages: false,
-      canUseTool: this.interactions.canUseTool(input, runId, queue),
+      canUseTool: this.interactions.canUseTool(() => connection.currentRun),
       hooks: {
         PreToolUse: [
           {
             matcher: "AskUserQuestion",
-            hooks: [this.interactions.askUserQuestionHook(input, runId, queue)],
+            hooks: [this.interactions.askUserQuestionHook(() => connection.currentRun)],
           },
         ],
       },
@@ -135,31 +175,86 @@ export class ClaudeCodeDriver implements CodeAgentDriver {
     };
   }
 
-  private async consumeQuery(
-    sessionId: string,
-    runId: string,
-    queryInstance: Query,
-    queue: AsyncQueue<AgentRunEvent>,
-  ): Promise<void> {
+  private async consumeConnection(connection: ClaudeCodeSessionConnection): Promise<void> {
     try {
-      let queueClosed = false;
-      for await (const message of queryInstance) {
-        if (queueClosed) continue;
-        const events = this.eventMapper.eventsFromMessage(sessionId, runId, message);
-        for (const event of events) queue.push(event);
+      for await (const message of connection.query) {
+        const activeRun = connection.currentRun;
+        if (!activeRun) continue;
+        const events = this.eventMapper.eventsFromMessage(connection.sessionId, activeRun.runId, message);
+        for (const event of events) activeRun.queue.push(event);
         if (events.some((event) => event.type === "run_completed")) {
-          queue.close();
-          queueClosed = true;
+          this.finishRun(connection, activeRun);
         }
       }
-      queue.close();
     } catch (error) {
-      queue.throw(error instanceof Error ? error : new Error(String(error)));
-      this.interactions.rejectPendingForRun(runId, error instanceof Error ? error : new Error(String(error)));
+      this.failActiveRun(connection, error instanceof Error ? error : new Error(String(error)));
     } finally {
-      this.activeQueries.delete(runId);
-      this.interactions.rejectPendingForRun(runId, new Error("Claude Code run ended before the request was resolved"));
-      this.eventMapper.clearRun(runId);
+      if (connection.currentRun && !connection.closed) {
+        this.failActiveRun(connection, new Error("Claude Code query ended before the run completed"));
+      }
+      this.cleanupConnection(connection);
     }
   }
+
+  private finishRun(connection: ClaudeCodeSessionConnection, activeRun: ActiveClaudeRun): void {
+    if (connection.currentRun !== activeRun) return;
+    activeRun.queue.close();
+    connection.currentRun = undefined;
+    this.runConnections.delete(activeRun.runId);
+    this.interactions.rejectPendingForRun(activeRun.runId, new Error("Claude Code run ended before the request was resolved"));
+    this.eventMapper.clearRun(activeRun.runId);
+  }
+
+  private failActiveRun(connection: ClaudeCodeSessionConnection, error: Error): void {
+    const activeRun = connection.currentRun;
+    if (!activeRun) return;
+    activeRun.queue.throw(error);
+    connection.currentRun = undefined;
+    this.runConnections.delete(activeRun.runId);
+    this.interactions.rejectPendingForRun(activeRun.runId, error);
+    this.eventMapper.clearRun(activeRun.runId);
+  }
+
+  private interruptActiveRun(connection: ClaudeCodeSessionConnection, error: Error): void {
+    const activeRun = connection.currentRun;
+    if (!activeRun) return;
+    activeRun.queue.push({
+      type: "run_completed",
+      sessionId: connection.sessionId,
+      runId: activeRun.runId,
+      status: "interrupted",
+    });
+    activeRun.queue.close();
+    connection.currentRun = undefined;
+    this.runConnections.delete(activeRun.runId);
+    this.interactions.rejectPendingForRun(activeRun.runId, error);
+    this.eventMapper.clearRun(activeRun.runId);
+  }
+
+  private closeConnection(connection: ClaudeCodeSessionConnection, error: Error): void {
+    if (connection.closed) return;
+    connection.closed = true;
+    connection.inputQueue.close();
+    connection.query.close();
+    this.interruptActiveRun(connection, error);
+  }
+
+  private cleanupConnection(connection: ClaudeCodeSessionConnection): void {
+    connection.closed = true;
+    connection.inputQueue.close();
+    if (this.sessionConnections.get(connection.sessionId) === connection) {
+      this.sessionConnections.delete(connection.sessionId);
+    }
+  }
+}
+
+function toSdkUserMessage(text: string): SDKUserMessage {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "text", text }],
+    },
+    parent_tool_use_id: null,
+  };
 }

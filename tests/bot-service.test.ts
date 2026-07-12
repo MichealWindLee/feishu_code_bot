@@ -9,6 +9,7 @@ import type {
   AgentSession,
   CodeAgentDriver,
   CreateAgentSessionInput,
+  DisposeAgentSessionInput,
   InterruptAgentRunInput,
   ResolveAgentApprovalInput,
   ResolveAgentUserInputInput,
@@ -493,6 +494,7 @@ describe("BotService", () => {
     await service.waitForIdle();
 
     expect(agent.interruptedRuns).toEqual([{ sessionId: "session-1", runId: "run-1" }]);
+    expect(agent.disposedSessions).toEqual([{ sessionId: "session-1", project: expect.objectContaining({ key: "bot" }) }]);
     expect(await store.getPendingApproval("a1")).toBeNull();
     expect(await store.getCurrentSession("u1")).toEqual(
       expect.objectContaining({
@@ -501,6 +503,25 @@ describe("BotService", () => {
       }),
     );
     expect(messages.markdown.at(-1)).toContain("Ended");
+  });
+
+  it("disposes the idle agent session when switching projects", async () => {
+    const { service, agent, messages, store } = makeHarness();
+    await store.upsertCurrentSession({
+      userOpenId: "u1",
+      projectKey: "bot",
+      agentSessionId: "session-1",
+      activeRunId: null,
+      lastChatId: "chat-1",
+      updatedAt: Date.now(),
+    });
+
+    await service.handleEvent(message("/use bot"));
+    await service.waitForIdle();
+
+    expect(agent.disposedSessions).toEqual([{ sessionId: "session-1", project: expect.objectContaining({ key: "bot" }) }]);
+    expect(await store.getCurrentSession("u1")).toEqual(expect.objectContaining({ projectKey: "bot", agentSessionId: null }));
+    expect(messages.markdown.at(-1)).toContain("Switched");
   });
 
   it("queues new prompts while an idle session is ending", async () => {
@@ -673,6 +694,7 @@ class FakeAgent implements CodeAgentDriver {
   resumedSessions: ResumeAgentSessionInput[] = [];
   runInputs: StartAgentRunInput[] = [];
   interruptedRuns: InterruptAgentRunInput[] = [];
+  disposedSessions: DisposeAgentSessionInput[] = [];
   resolvedApprovals: ResolveAgentApprovalInput[] = [];
   resolvedUserInputs: ResolveAgentUserInputInput[] = [];
 
@@ -691,6 +713,10 @@ class FakeAgent implements CodeAgentDriver {
   async resumeSession(input: ResumeAgentSessionInput): Promise<AgentSession> {
     this.resumedSessions.push(input);
     return { id: input.sessionId, resumeSupported: this.capabilities.resumeSession };
+  }
+
+  async disposeSession(input: DisposeAgentSessionInput): Promise<void> {
+    this.disposedSessions.push(input);
   }
 
   async *startRun(input: StartAgentRunInput): AsyncIterable<AgentRunEvent> {

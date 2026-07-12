@@ -31,20 +31,29 @@ type PendingUserInput = {
   reject: (error: Error) => void;
 };
 
+export type ClaudeCodeInteractionRunContext = {
+  input: StartAgentRunInput;
+  runId: string;
+  queue: AsyncQueue<AgentRunEvent>;
+};
+
+type GetRunContext = () => ClaudeCodeInteractionRunContext | undefined;
+
 export class ClaudeCodeInteractions {
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly pendingUserInputs = new Map<string, PendingUserInput>();
 
   constructor(private readonly displayName: string) {}
 
-  canUseTool(input: StartAgentRunInput, runId: string, queue: AsyncQueue<AgentRunEvent>): CanUseTool {
+  canUseTool(getRunContext: GetRunContext): CanUseTool {
     return async (toolName, toolInput, options): Promise<PermissionResult> => {
+      const context = this.requireRunContext(getRunContext);
       if (toolName === "AskUserQuestion") {
         const response = await this.requestUserInput({
-          input,
-          runId,
-          queue,
-          requestId: `${runId}:${options.toolUseID}`,
+          input: context.input,
+          runId: context.runId,
+          queue: context.queue,
+          requestId: `${context.runId}:${options.toolUseID}`,
           toolInput,
         });
         return {
@@ -54,11 +63,11 @@ export class ClaudeCodeInteractions {
         };
       }
 
-      const requestId = `${runId}:${options.toolUseID}`;
+      const requestId = `${context.runId}:${options.toolUseID}`;
       const approved = await this.requestApproval({
-        input,
-        runId,
-        queue,
+        input: context.input,
+        runId: context.runId,
+        queue: context.queue,
         requestId,
         toolName,
         toolInput,
@@ -79,14 +88,15 @@ export class ClaudeCodeInteractions {
     };
   }
 
-  askUserQuestionHook(input: StartAgentRunInput, runId: string, queue: AsyncQueue<AgentRunEvent>): HookCallback {
+  askUserQuestionHook(getRunContext: GetRunContext): HookCallback {
     return async (hookInput, toolUseID): Promise<HookJSONOutput> => {
+      const context = this.requireRunContext(getRunContext);
       const preToolUse = hookInput as PreToolUseHookInput;
-      const requestId = `${runId}:${toolUseID ?? preToolUse.tool_use_id}`;
+      const requestId = `${context.runId}:${toolUseID ?? preToolUse.tool_use_id}`;
       const response = await this.requestUserInput({
-        input,
-        runId,
-        queue,
+        input: context.input,
+        runId: context.runId,
+        queue: context.queue,
         requestId,
         toolInput: asRecord(preToolUse.tool_input),
       });
@@ -192,5 +202,11 @@ export class ClaudeCodeInteractions {
     return new Promise<AgentUserInputResponse>((resolve, reject) => {
       this.pendingUserInputs.set(args.requestId, { runId: args.runId, resolve, reject });
     });
+  }
+
+  private requireRunContext(getRunContext: GetRunContext): ClaudeCodeInteractionRunContext {
+    const context = getRunContext();
+    if (!context) throw new Error("Claude Code requested interaction without an active run");
+    return context;
   }
 }
